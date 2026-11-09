@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GAME.GG - 배틀그라운드 전적 검색</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&family=Teko:wght@700&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config={theme:{extend:{fontFamily:{sans:['Noto Sans KR','sans-serif'],brand:['Teko','sans-serif']}}}};
+  </script>
+  <style>
+    body{background:#0b0f19;color:#f1f5f9}
+    .hero-bg{background:linear-gradient(180deg,rgba(11,15,25,.72),rgba(11,15,25,.97)),url('https://images.unsplash.com/photo-1542751371-adc38448a05e?q=80&w=2070&auto=format&fit=crop');background-size:cover;background-position:center}
+    .stat-card{background:rgba(15,23,42,.88);border:1px solid rgba(71,85,105,.5);border-radius:14px;padding:18px}
+  </style>
+</head>
+<body class="min-h-screen flex flex-col font-sans">
+<nav class="bg-slate-950/95 border-b border-slate-800">
+  <div class="max-w-6xl mx-auto px-5 h-16 flex items-center justify-between">
+    <a href="/" class="font-brand text-3xl font-bold tracking-wider">GAME<span class="text-sky-400">.GG</span></a>
+    <span class="text-sm text-sky-400">배틀그라운드 전적 검색</span>
+  </div>
+</nav>
+<main class="flex-1">
+  <section class="hero-bg min-h-[560px] flex items-center justify-center px-4 py-16">
+    <div class="w-full max-w-3xl text-center space-y-7">
+      <div class="inline-flex items-center gap-3 rounded-full bg-slate-900/80 border border-slate-700 px-4 py-2 text-xs text-slate-300">
+        <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span> PUBG LIVE PLAYER DATA
+      </div>
+      <div class="space-y-3">
+        <h1 class="text-4xl sm:text-5xl font-black">플레이어 전적 검색</h1>
+        <p class="text-slate-400">스팀 / 카카오 플랫폼의 배틀그라운드 플레이어를 검색하세요.</p>
+      </div>
+      <div class="rounded-2xl border border-slate-700 bg-slate-900/90 p-3 shadow-2xl">
+        <form id="searchForm" class="flex flex-col sm:flex-row gap-2">
+          <div class="flex rounded-xl bg-slate-800 p-1">
+            <button type="button" id="steamButton" class="px-5 py-3 rounded-lg bg-sky-600 font-bold" onclick="selectPlatform('steam')">STEAM</button>
+            <button type="button" id="kakaoButton" class="px-5 py-3 rounded-lg text-slate-400 font-bold" onclick="selectPlatform('kakao')">KAKAO</button>
+          </div>
+          <input id="nicknameInput" required autocomplete="off" placeholder="배틀그라운드 닉네임 입력" class="min-h-12 flex-1 bg-transparent px-4 outline-none">
+          <button id="searchButton" class="rounded-xl bg-sky-600 hover:bg-sky-500 px-8 py-3 font-bold"><i class="fa-solid fa-magnifying-glass"></i> 검색</button>
+        </form>
+      </div>
+      <div id="message" class="hidden rounded-xl border border-slate-700 bg-slate-900/90 p-4 text-sm"></div>
+      <section id="result" class="hidden text-left space-y-4">
+        <div class="rounded-2xl border border-slate-700 bg-slate-900/90 p-5">
+          <div class="flex flex-wrap justify-between gap-2 items-center">
+            <div><p class="text-xs text-slate-400">PLAYER</p><h2 id="playerName" class="text-2xl font-black"></h2></div>
+            <span id="playerPlatform" class="text-xs rounded-full bg-sky-900 px-3 py-1 text-sky-300"></span>
+          </div>
+          <p id="playerId" class="mt-2 text-xs text-slate-500 break-all"></p>
+        </div>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <div class="stat-card"><p class="text-xs text-slate-400">K/D</p><p id="kd" class="text-2xl font-bold mt-2">-</p></div>
+          <div class="stat-card"><p class="text-xs text-slate-400">승률</p><p id="winRate" class="text-2xl font-bold mt-2">-</p></div>
+          <div class="stat-card"><p class="text-xs text-slate-400">평균 피해량</p><p id="avgDamage" class="text-2xl font-bold mt-2">-</p></div>
+          <div class="stat-card"><p class="text-xs text-slate-400">총 경기</p><p id="rounds" class="text-2xl font-bold mt-2">-</p></div>
+        </div>
+        <p id="notice" class="text-xs text-amber-300"></p>
+      </section>
+    </div>
+  </section>
+</main>
+<footer class="border-t border-slate-900 bg-slate-950 py-7 text-center text-xs text-slate-500">
+  <p class="font-brand text-2xl">GAME<span class="text-sky-500">.GG</span></p>
+  <p class="mt-2">PUBG Capstone Project · © 2026 GAME.GG</p>
+</footer>
+<script>
+let currentPlatform='steam';
+function selectPlatform(platform){
+  currentPlatform=platform;
+  const steam=document.getElementById('steamButton'), kakao=document.getElementById('kakaoButton');
+  steam.className='px-5 py-3 rounded-lg font-bold '+(platform==='steam'?'bg-sky-600':'text-slate-400');
+  kakao.className='px-5 py-3 rounded-lg font-bold '+(platform==='kakao'?'bg-amber-600':'text-slate-400');
+}
+function showMessage(text,type='info'){
+  const box=document.getElementById('message'); box.textContent=text; box.classList.remove('hidden','text-red-300','text-emerald-300','text-sky-300');
+  box.classList.add(type==='error'?'text-red-300':type==='success'?'text-emerald-300':'text-sky-300');
+}
+document.getElementById('searchForm').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const nickname=document.getElementById('nicknameInput').value.trim();
+  const button=document.getElementById('searchButton');
+  if(!nickname){showMessage('닉네임을 입력해 주세요.','error');return;}
+  button.disabled=true; button.textContent='검색 중...'; document.getElementById('result').classList.add('hidden');
+  showMessage('공식 PUBG API에서 플레이어 정보를 불러오고 있습니다.');
+  try{
+    const response=await fetch(`/api/player?nickname=${encodeURIComponent(nickname)}&platform=${currentPlatform}`);
+    const data=await response.json();
+    if(!response.ok) throw new Error(data.error||'검색에 실패했습니다.');
+    document.getElementById('playerName').textContent=data.nickname;
+    document.getElementById('playerPlatform').textContent=data.platform;
+    document.getElementById('playerId').textContent='Player ID: '+data.playerId;
+    const s=data.stats||{};
+    document.getElementById('kd').textContent=s.kd??'-';
+    document.getElementById('winRate').textContent=(s.winRate??0)+'%';
+    document.getElementById('avgDamage').textContent=s.avgDamage??'-';
+    document.getElementById('rounds').textContent=s.roundsPlayed??0;
+    document.getElementById('notice').textContent=data.notice||'현재 시즌 통계 기준입니다.';
+    document.getElementById('result').classList.remove('hidden');
+    showMessage('플레이어 검색에 성공했습니다.','success');
+  }catch(err){showMessage(err.message,'error');}
+  finally{button.disabled=false;button.innerHTML='<i class="fa-solid fa-magnifying-glass"></i> 검색';}
+});
+</script>
+</body>
+</html>

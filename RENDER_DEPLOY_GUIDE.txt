@@ -1,0 +1,5 @@
+Render build: pip install -r requirements.txt
+Render start: gunicorn app:app
+Keep API keys and GAMEGG_ADMIN_* / GAMEGG_SECRET_KEY in Render Environment, never in GitHub.
+Upload these files to the gamegg-update branch first. Do not merge until tested.
+SQLite data on ephemeral Render disk is not durable. Configure persistent storage before relying on boards/admin data.

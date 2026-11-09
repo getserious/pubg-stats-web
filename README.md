@@ -1,19 +1,101 @@
-GAME.GG - Original design + all platform ranked season details + official leaderboards
+# GAME.GG 실행 안내
 
-1. Copy .env.example to .env and set PUBG_API_KEY.
-2. Run start_windows.bat on Windows.
-3. Open http://127.0.0.1:5000.
-4. Search on Steam / Kakao / PSN / Xbox; select a season under the chart to inspect that season's ranked RP, tier, wins and games.
-5. Official TOP 10 has separate platform and region selectors; it is NOT a merged global ranking. Click refresh to request new data.
+1. ZIP을 새 폴더에 전부 압축 해제합니다.
+2. 기존 프로젝트의 `.env`를 이 폴더로 복사합니다. 없으면 `.env.example`을 `.env`로 복사하고 PUBG_API_KEY를 입력합니다.
+3. 게시판을 유지하려면 기존 `cache.sqlite3`도 서버 종료 후 복사합니다. OTP를 유지하려면 기존 관리자 환경변수도 그대로 복사합니다.
+4. 기존 서버/Cloudflare 창을 닫은 뒤 Windows에서 `start.bat` 하나를 실행합니다. 사이트가 준비되면 로컬 페이지가 먼저 열리고 Cloudflare도 자동으로 켜집니다. 터널 연결 완료와 외부 주소의 GAME.GG 응답을 확인한 뒤 외부 주소를 `public_url.txt`에 저장하고 브라우저로 엽니다. Python 3.10 이상과 최초 설치 시 인터넷이 필요합니다. USB로 옮길 때 `.venv`는 복사하지 마세요.
 
-IMPORTANT:
-- Player search and ranked stats use platform shards (steam/kakao/psn/xbox).
-- Leaderboards use platform-region shards (pc-*, pc-kakao, psn-*, xbox-*), per PUBG official API documentation.
-- Current season is read from the official isCurrentSeason flag. No player data or RP is hardcoded.
-- The upstream leaderboard has its own update schedule: refresh does not guarantee changed rankings.
-- Requesting 6 or 12 seasons may use many rate-limited requests. Cache season details for 10 minutes; season list for 30 days.
-- An API 404/429 is returned as JSON with ok:false (HTTP 200 at the GAME.GG app boundary); it is not fabricated as a successful result.
-- Prior season RP/tier can be unavailable depending on the upstream API.
-- API integration was not tested against the live PUBG servers. Automated tests use mocked responses.
+## 반영 기능
+- 왼쪽 공식 경쟁전 티어와 닉네임 표시. API currentTier/subTier를 사용하며 RP로 공식 티어를 추측하지 않습니다.
+- 시즌별 RP/경기 수 그래프, 최대 전체 시즌(100개), 펼쳐 보는 경쟁전 및 일반전 통계. 모드별 분리.
+- API가 제공하는 최대 최근 20경기와 경기별 상세보기. 전체 참가자와 팀 순위, 처치/사망 로그, 전체 킬로그, 무기 아이콘과 헤드샷 아이콘. 몸샷 표시는 생략합니다. 스쿼드는 같은 팀 순위가 중복됩니다.
+- 최근 선택 모드의 TOP10 횟수, 최장 처치, 평균 생존. 시즌 값이 API에 없으면 미제공 표시.
+- 최근 20경기 전투 성향, 기본점수 15, 다른 유저 비교, 같은 플랫폼/모드 RP ±500의 실제 분석 표본 평균(다른 유저 2명 이상).
+- 지역/플랫폼/모드별 실시간 TOP10와 닉네임 검색 연결. API 호출 시 순위를 새로 조회합니다.
+- 듀오/스쿼드 모집, RP 조건, 공지, 기존 비밀 주소+비밀번호+TOTP 관리자 로그인과 삭제 기능.
 
-최근 20경기: 공식 /api/history?limit=20 응답 기반 카드, 필터, 요약, 상세 펼치기. 경쟁전/일반전은 API matchType 기준.
+## 이번 수정 사항
+- 닉네임 바로 옆에 공식 티어 아이콘과 이름, 아래에 RP와 GAME.GG 등급을 표시합니다.
+- 실시간 TOP10에도 API tier/subTier를 전달하고 공식 티어, RP, GAME.GG 등급을 표시합니다.
+- 자체 RP 티어표를 복원했으며 현재 등급을 강조합니다.
+- 안전한 운영 문구를 우리만의 티어표로 변경했습니다.
+- RP/경기수 차트를 탭으로 전환하는 시즌 성장 기록으로 교체했습니다.
+- 시즌 카드는 고정된 열 배치와 동일한 글꼴을 사용합니다.
+- 최근 요약은 전체 모드 20경기를 기본으로 하며, 별도의 모드 필터를 제공합니다. 경쟁전 시즌 선택과 독립적입니다.
+- 참가자 전체 순위 및 킬로그의 서버 파서와 화면 렌더링 코드는 그대로 유지했습니다.
+
+## 미제공 및 0경기 원인
+기존 코드는 경쟁전 통계에 일반전 필드인 top10s/timeSurvived를 적용했습니다. 공식 경쟁전 통계에는 top10Ratio가 있으며 TOP10 횟수 필드는 없습니다. avgSurvivalTime/longestKill은 공식 API v20.1.0에서 deprecated로 분류된 항목으로 현재 집계 값으로 신뢰하기 어렵습니다. 이제 시즌 경쟁전 카드에는 RP/경기/승리/승률/처치/평균피해량/평균순위/KDA를 표시하고, TOP10 횟수/최장처치/평균생존은 최근 경기 원본 stats로 계산합니다. 과거 시즌 전체 수치라고 표시하거나 일반전 값을 경쟁전 값으로 혼용하지 않습니다. 같은 시즌 일반전 버튼은 일반전 통계를 별도로 표시합니다.
+
+스크린샷의 최근 경기는 duo인데 기존 요약이 squad만 일치 필터링하여 0경기로 보였습니다. API 경기 조회가 실패한 증거는 아니며 프런트엔드 필터 문제입니다. 최근 조회 수와 필터 적용 수를 구분해 표시합니다.
+
+## 공식 이미지 출처
+브론즈부터 서바이버까지의 아이콘은 PUBG 공식 개발일지의 티어 안내 이미지를 그대로 보관하고 CSS로 해당 영역을 표시합니다. 등급은 API currentTier 또는 leaderboard tier/subTier를 사용하며 RP로 공식 티어를 추정하지 않습니다.
+- https://pubg.com/en/news/8722
+- https://wstatic-prod-boc.krafton.com/common/news/20250604/aqs1bGfy.jpg
+- https://documentation.pubg.com/en/seasons-endpoint.html
+- https://documentation.pubg.com/en/changelog/changelog.html
+
+## 데이터 범위
+최근 최대 20경기는 API가 반환한 경기 목록 기준입니다. 기록 보존기간/활동내역/지원모드에 따라 20경기 미만일 수 있습니다. 스쿼드/듀오는 같은 팀 순위가 중복될 수 있습니다. 시즌 전적의 모드/시점은 최근 20경기 요약과 별개입니다. PUBG는 시즌36부터 경쟁전 RP와 티어를 통합했으므로 모드간 RP가 같게 제공될 수 있습니다. 실제 조회값을 사용합니다.
+
+## 검증
+verify.py: Flask/정적 파일, 20경기, 100명 참가자, 헤드샷/무기/시간/거리 파서, 경기 소유 확인, 모드/시즌 분리.
+브라우저 모의 응답으로 닉네임 서바이버/크리스탈 표시, 자체 티어표, TOP10 10명 티어, 전체20경기/듀오18경기 필터, RP/경기수 차트 전환, 시즌 상세 카드, 참가자100명+킬로그, 모바일 가로 넘침과 JavaScript 오류를 확인했습니다. 한글 가변 폰트 Noto Sans KR을 포함했으며 라이선스는 static/fonts/OFL.txt에 있습니다.
+실제 API 키로 라이브 조회는 하지 않았습니다.
+
+## 사이트 + Cloudflare 통합 실행
+- `start.bat`를 한 번만 실행하면 Python 환경 준비 → 기존 cloudflared 찾기 → 사이트 준비 확인 → Cloudflare 연결 순서로 실행합니다.
+- cloudflared가 프로젝트 폴더 또는 PATH에 있으면 그대로 사용합니다. 없으면 Windows용 실행 파일을 Cloudflare 공식 GitHub 배포처에서 자동 다운로드합니다. 다운로드 실패 시 창에 오류가 남으며, 직접 받은 cloudflared.exe를 start.bat 옆에 넣으면 됩니다.
+- 서버와 터널 로그는 같은 창에 나옵니다. Ctrl+C로 두 프로세스를 함께 종료합니다. 종료 시 public_url.txt는 지워져 오래된 주소가 남지 않습니다. 컴퓨터를 켜 두고 이 창을 유지해야 접속할 수 있습니다.
+- 기본은 임시 trycloudflare.com 주소입니다. 재실행 시 주소가 바뀔 수 있습니다.
+- 기존 고정 도메인의 로컬 관리 Named Tunnel을 쓰는 경우에만 .env의 GAMEGG_TUNNEL_NAME에 기존 터널 이름/UUID를 적습니다. 사용자 기존 config/인증서를 사용하며, 해당 서비스 URL의 포트가 .env의 PORT와 맞아야 합니다. 기본값은 비워 두세요.
+- Windows 자체에서 실행 검증하지는 않았습니다. 실행 순서, 준비 대기, URL 검출, 오류/정리 동작은 모의 프로세스로 검증했습니다.
+- 공식 다운로드 안내: https://developers.cloudflare.com/tunnel/downloads/
+
+## NXDOMAIN 대응 수정
+이전 실행기는 Cloudflare가 주소를 할당하자마자 브라우저를 열었습니다. 주소 할당은 실제 터널 연결이나 DNS/HTTPS 준비 완료를 뜻하지 않습니다.
+이제 로컬 페이지를 먼저 열고, `Registered tunnel connection` 로그를 확인한 후 해당 외부 주소의 `/api/health`가 실제 GAME.GG JSON을 반환할 때만 `[PUBLIC READY]`를 출력하고 외부 페이지를 엽니다.
+외부 확인 실패 시 기다리며 90초 뒤 새 주소로 재시도합니다. 재시도는 HTTP/2를 사용하며 최대 3개 주소를 시도합니다. 마지막 터널은 유지하면서 확인을 계속합니다. 외부 연결 문제가 있어도 정상 실행 중인 로컬 서버를 종료하지 않습니다. 주소 미할당/미연결 상태는 성공으로 표시하지 않습니다.
+DNS 오류가 계속되면 외부 접속을 보장할 수 없습니다. Windows DNS 캐시, 사용 중인 DNS 서버 또는 Cloudflare 임시 주소 상태를 확인해야 합니다. 우선 실행창이 켜진 상태에서 http://127.0.0.1:5000 으로 사이트를 사용할 수 있습니다.
+검증: NXDOMAIN 후 성공 재시도, 연결 등록 전 공개 방지, 다른 서비스/502 응답 차단, HTTP/2 재시도, 오래된 작업 결과 무시, 로컬 우선 실행/종료 정리 등 8개 오프라인 테스트 통과. 실제 사용자 Windows 네트워크에서는 미검증입니다.
+
+## KDA 표시 수정
+기존 화면은 API kda 값을 그대로 표시했습니다. 이제 현재 시즌/과거 시즌 모두 실제 집계 kills/assists/deaths가 유효하면 (kills+assists)/deaths를 계산하여 소수 둘째 자리까지 표시하고, 바로 아래 처치·도움·사망 수를 함께 표시합니다.
+사망 0회는 분모를 임의로 1로 바꾸지 않고 비율 없음(—)으로 표시합니다. 필수 값이 빠지면 유효한 양수 API KDA만 보조적으로 사용하며, 그것도 없으면 계산 불가로 구분합니다. 누락된 값을 0으로 간주하거나 경기 수-승리 수로 사망 수를 추정하지 않습니다.
+이번 KDA 변경만 적용하려면 static/app.js와 templates/index.html을 덮어쓰고 Ctrl+F5로 새로고침하세요. 기존 .env/DB를 다시 변경할 필요는 없습니다.
+
+## 솔로·듀오·스쿼드 비교 화면
+닉네임 아래에 시즌 선택과 TPP/FPP 전환을 추가했습니다. 경쟁전 3개 카드와 일반전 3개 카드를 동시에 보여줍니다. solo/duo/squad 및 solo-fpp/duo-fpp/squad-fpp 키를 각각 사용하며 다른 모드 데이터를 복제하지 않습니다.
+- 경쟁전: 공식 티어, RP, K/D, KDA, 승률, TOP10 비율 원값, 평균 피해량, 경기 수, 평균 순위, 처치, 도움.
+- 일반전: 승리/패배, 킬/패배 또는 실제 사망 수가 있을 때의 K/D, 평균 킬, 승률, TOP10 진입률/횟수, 평균 피해량, 경기 수, 헤드샷 비율, 최장 처치, 평균 생존, 최다 처치, 총 처치.
+일반전 API에는 실제 사망 수가 없을 수 있어 losses가 제공되면 `킬 / 패배`라고 명확히 표시합니다. 경쟁전 TOP10 비율 원값을 임의로 TOP10 횟수나 백분율로 바꾸지 않습니다.
+기록 없음과 조회 실패를 구분합니다. 시즌 변경은 해당 시즌의 경쟁전/일반전 데이터를 한 번 조회하고, TPP/FPP 전환은 같은 응답의 다른 모드 키를 사용하므로 추가 호출하지 않습니다. 이전 시즌 조회가 늦게 끝나도 새 시즌 선택/새 닉네임 검색을 덮어쓰지 않습니다.
+이번 화면 변경은 static/app.js, static/style.css, templates/index.html 세 파일만 덮어쓰고 Ctrl+F5로 새로고침하여 적용할 수 있습니다. 전체 ZIP에는 이전 Cloudflare 및 KDA 수정도 포함되어 있습니다.
+
+모드 카드 브라우저 검증: 경쟁전/일반전 6개 카드, TPP/FPP 각 모드별 독립 값, 기록 없음/조회 실패, 과거 시즌 선택과 캐시, 시점 전환 시 추가 호출 없음, 모바일 가로 넘침 없음, JavaScript 오류 없음. 실제 API 키로 해당 화면의 라이브 조회는 미검증입니다.
+
+## API 키가 .env에 있는데도 없다고 나오는 경우
+Windows 메모장의 UTF-8 BOM/UTF-16과 CP949 인코딩을 지원하도록 설정 로더를 수정했습니다. .env에 유효한 PUBG_API_KEY가 있으면 빈 값/오래된 시스템 환경변수보다 우선합니다. `Bearer `가 값 앞에 붙어 있으면 접두사를 제거합니다. .env.txt만 존재하거나 .env에 키가 없고 .env.txt에 유효한 키가 있으면 키를 읽고 실제 읽은 파일명을 실행창에 표시합니다. 다른 폴더의 파일을 탐색하거나 기존 .env 파일을 수정하지 않습니다.
+`check_config.bat`를 실행하면 현재 프로젝트 폴더, 읽은 파일/인코딩, API 키 로드 성공 여부, 실행 중인 서버가 최신 빌드인지 표시합니다. 키의 값·일부·지문은 출력하지 않습니다. 이 진단 결과는 로컬 CMD 창에만 표시됩니다. `/api/health`에는 경로/설정값 대신 빌드 ID와 키 설정 여부만 포함합니다.
+이번 수정 적용은 gamegg_config.py, check_config.py, check_config.bat, app.py, run_all.py를 기존 프로젝트에 덮어쓴 뒤 기존 서버 창을 닫고 start.bat로 다시 실행하세요. .env/게시판 DB는 덮어쓰지 마세요.
+
+설정 로더 검증: UTF-8/BOM/UTF-16/CP949, 빈 값·기존 환경변수 우선순위, .env.txt 대체 읽기, Bearer/따옴표 정리, 예시 키 차단, 키 미노출, 구버전 서버 감지 등 8개 테스트 통과. 통합 실행기 8개 테스트 및 기존 API 파서 검증도 통과했습니다.
+
+## 진단기의 dotenv 설치 오류 수정
+check_config.bat가 시스템 Python 대신 사이트와 동일한 .venv\Scripts\python.exe를 사용합니다. 가상환경이 없으면 자동 생성하고, python-dotenv가 없으면 같은 인터프리터의 pip로 설치한 뒤 진단을 실행합니다. pip가 없으면 ensurepip를 시도합니다. 설치 실패 시 창이 유지되며 오류가 표시됩니다.
+
+## 12시즌/전체 시즌 및 플랫폼 조회 수정
+이전 코드는 오래된 시즌부터 조회하다가 429에서 중단되어 최근 6시즌이 사라질 수 있었습니다. 최신 시즌 우선으로 최대 6개씩 조회하고 첫 응답부터 화면에 반영합니다. 6/12/전체 범위 전환에도 확보된 기록을 유지하며, 요청 제한/인증/연결 실패 시 중단 사유와 남은 시즌 재시도 버튼을 표시합니다. 경쟁전 통계 제공 이전 시즌은 미지원으로 표시하고 불필요한 요청을 하지 않습니다.
+선택한 범위/모드가 바뀐 후 도착한 이전 요청 응답은 무시합니다. 성공, 기록 없음, 조회 대기, 요청 제한, 조회 실패, 경쟁전 미지원을 구분합니다. 전체 시즌이 API 요청 제한 안에서 즉시 전부 조회된다고 보장하지 않으며, 제한이 풀리면 재시도로 이어서 확인합니다.
+플레이어/시즌 응답에 다른 플랫폼 shardId가 명시되면 PLATFORM_MISMATCH로 차단합니다. 선택한 플랫폼만 조회하며 반대 플랫폼으로 몰래 전환하거나 추가 조회하지 않습니다. 닉네임만 있고 현재 시즌/최근 경기 전적이 없으면 성공 대신 해당 플랫폼에서 전적 확인 불가와 플랫폼/시즌 확인 안내를 표시합니다. 오래 미접속한 계정 등도 같은 상태일 수 있어, 기록 없음만으로 다른 플랫폼 계정이라고 단정하지 않습니다. 과거 시즌 기록은 계속 확인 가능합니다.
+검증: 6/12/전체 분할 조회 및 최신 우선 순서, 429/연결 실패 중단과 재시도 위치, 제공 이전 시즌 제외, Steam/Kakao 불일치 차단, 닉네임만 있는 응답 안내 등 서버 테스트 9개 통과. 브라우저 모의 응답으로 전체 44시즌, 요청 제한 중 최근 기록 유지/재시도, 오래된 응답 무시, 플랫폼 오류/전적 미확인 안내를 확인했습니다. 실제 API 키를 사용한 라이브 조회는 미검증입니다.
+적용: 기존 .env와 DB를 유지하고 수정본 내용을 덮어쓴 뒤 서버를 재실행하고 Ctrl+F5를 누르세요. 이번 필수 변경 파일은 app.py, gamegg_config.py, static/app.js, static/style.css, templates/index.html입니다.
+
+## 관리자 주소 /gameggadmin 404 수정
+기존의 24자 최소 길이 제한 때문에 gameggadmin 같은 경로가 차단됐습니다. 경로를 1~96자의 영문/숫자/밑줄/하이픈으로 허용하도록 수정했습니다. 비밀번호+TOTP+세션 비밀키 요구사항은 유지합니다.
+GAMEGG_ADMIN_PATH=gameggadmin 또는 /gameggadmin을 사용할 수 있으며, http://127.0.0.1:5000/gameggadmin 같은 전체 URL을 넣어도 경로 부분을 추출합니다. http/https가 빠진 localhost:5000/gameggadmin, 127.0.0.1:5000/gameggadmin도 지원합니다. 폴더 경로와 쿼리 값은 관리자 경로로 쓰지 않습니다.
+브라우저에서는 http://127.0.0.1:5000/gameggadmin 으로 접속합니다. Cloudflare 주소에서는 해당 호스트 뒤에 /gameggadmin을 붙입니다. .env 변경 후에는 기존 서버를 종료하고 다시 실행해야 반영됩니다.
+여전히 404이면 check_config.bat의 [ADMIN] 행을 확인하세요. 누락되거나 잘못된 설정 이름만 표시하며 비밀번호/OTP 비밀키/관리자 경로 값은 출력하지 않습니다.
+
+관리자 경로 검증: 짧은 경로/전체 URL/스킴 없는 로컬 URL 정규화, 실제 환경변수에서 모듈 로드 후 /gameggadmin HTTP200, 잘못된 경로404, 인증 설정 누락404, 잘못된 OTP401, 정상 비밀번호/OTP 및 CSRF 로그인303을 확인했습니다.

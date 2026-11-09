@@ -2,13 +2,7 @@
 .env.*
 !.env.example
 .venv/
-venv/
 __pycache__/
-*.py[cod]
+*.pyc
 *.sqlite3
 *.db
-.pytest_cache/
-.DS_Store
-cloudflared.exe
-관리자키.txt
-*.log

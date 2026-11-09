@@ -1,133 +1,35 @@
-
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>GAME.GG | 배틀그라운드 전적 검색</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <style>
-    body { background: #0b0f19; color: #f1f5f9; font-family: Arial, sans-serif; }
-    .hero { background: linear-gradient(145deg, #101e35, #0b0f19); }
-    .stat { background: #172235; border: 1px solid #334155; border-radius: 14px; padding: 22px; }
-  </style>
-</head>
-<body>
-  <header class="border-b border-slate-800 bg-slate-900 p-5">
-    <div class="max-w-6xl mx-auto flex justify-between items-center">
-      <a href="/" class="text-3xl font-black text-white">GAME<span class="text-sky-400">.GG</span></a>
-      <span class="text-slate-400 text-sm">PUBG 전적 검색</span>
-    </div>
-  </header>
-
-  <main>
-    <section class="hero py-24 px-4 text-center">
-      <div class="max-w-3xl mx-auto">
-        <p class="text-sky-400 font-bold mb-4">PLAYER STATISTICS</p>
-        <h1 class="text-4xl md:text-5xl font-black mb-5">배틀그라운드 전적 검색</h1>
-        <p class="text-slate-400 mb-10">닉네임을 입력하고 플레이어의 시즌 전적을 확인하세요.</p>
-
-        <form id="searchForm" class="bg-slate-800 border border-slate-700 rounded-2xl p-4 flex flex-col md:flex-row gap-3">
-          <select id="platform" class="bg-slate-900 rounded-lg p-4 text-white">
-            <option value="steam">STEAM</option>
-            <option value="kakao">KAKAO</option>
-          </select>
-          <input id="nickname" type="text" required
-                 placeholder="배틀그라운드 닉네임 입력"
-                 class="flex-1 bg-slate-900 rounded-lg p-4 outline-none focus:ring-2 focus:ring-sky-500">
-          <button id="searchButton" type="submit"
-                  class="bg-sky-600 hover:bg-sky-500 rounded-lg px-8 py-4 font-bold">
-            전적 검색
-          </button>
-        </form>
-
-        <p id="message" class="mt-6 text-slate-400" role="status"></p>
-      </div>
-    </section>
-
-    <section id="results" class="hidden max-w-6xl mx-auto px-4 py-12">
-      <div class="bg-slate-900 border border-slate-800 rounded-2xl p-8 mb-6">
-        <p class="text-sky-400 text-sm font-bold">PLAYER PROFILE</p>
-        <h2 id="playerName" class="text-3xl font-black mt-2"></h2>
-        <p id="playerPlatform" class="text-slate-400 mt-2"></p>
-      </div>
-
-      <h3 class="text-2xl font-bold mb-6">시즌 전적 요약</h3>
-      <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <div class="stat"><p class="text-slate-400 mb-3">K/D</p><p id="kd" class="text-3xl font-black text-sky-400">-</p></div>
-        <div class="stat"><p class="text-slate-400 mb-3">승률</p><p id="winRate" class="text-3xl font-black">-</p></div>
-        <div class="stat"><p class="text-slate-400 mb-3">평균 피해량</p><p id="avgDamage" class="text-3xl font-black">-</p></div>
-        <div class="stat"><p class="text-slate-400 mb-3">경기 수</p><p id="matches" class="text-3xl font-black">-</p></div>
-      </div>
-      <p id="statsNotice" class="text-slate-500 text-sm mt-5"></p>
-    </section>
-  </main>
-
-  <footer class="border-t border-slate-800 text-center text-slate-500 py-8 text-sm">
-    © 2026 GAME.GG · PUBG Statistics Project
-  </footer>
-
-  <script>
-    const form = document.getElementById("searchForm");
-    const message = document.getElementById("message");
-    const results = document.getElementById("results");
-    const button = document.getElementById("searchButton");
-
-    function pick(obj, keys) {
-      for (const key of keys) {
-        if (obj && obj[key] !== undefined && obj[key] !== null) return obj[key];
-      }
-      return null;
-    }
-
-    form.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const nickname = document.getElementById("nickname").value.trim();
-      const platform = document.getElementById("platform").value;
-      if (!nickname) return;
-
-      results.classList.add("hidden");
-      button.disabled = true;
-      button.textContent = "검색 중...";
-      message.textContent = "PUBG 데이터를 불러오고 있습니다.";
-
-      try {
-        const url = `/api/player?nickname=${encodeURIComponent(nickname)}&platform=${encodeURIComponent(platform)}`;
-        const response = await fetch(url);
-        const data = await response.json();
-
-        if (!response.ok || data.ok === false || data.error) {
-          throw new Error(data.error || data.message || "플레이어 검색에 실패했습니다.");
-        }
-
-        const stats = data.summary || data.stats || data.statistics || {};
-        document.getElementById("playerName").textContent = data.nickname || nickname;
-        document.getElementById("playerPlatform").textContent = platform.toUpperCase();
-
-        const kd = pick(stats, ["kd", "k_d", "kdr"]);
-        const winRate = pick(stats, ["win_rate", "winRate"]);
-        const damage = pick(stats, ["avg_damage", "avgDamage", "averageDamage"]);
-        const matches = pick(stats, ["matches", "roundsPlayed", "games"]);
-
-        document.getElementById("kd").textContent = kd ?? "-";
-        document.getElementById("winRate").textContent =
-          winRate == null ? "-" : String(winRate).includes("%") ? winRate : winRate + "%";
-        document.getElementById("avgDamage").textContent = damage ?? "-";
-        document.getElementById("matches").textContent = matches ?? "-";
-        document.getElementById("statsNotice").textContent =
-          [kd, winRate, damage, matches].every(v => v == null)
-            ? "플레이어를 찾았지만 현재 표시 가능한 시즌 통계가 없습니다."
-            : "";
-
-        results.classList.remove("hidden");
-        message.textContent = "검색이 완료되었습니다.";
-      } catch (error) {
-        message.textContent = "오류: " + error.message;
-      } finally {
-        button.disabled = false;
-        button.textContent = "전적 검색";
-      }
-    });
-  </script>
-</body>
-</html>
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GAME.GG | PUBG 전적과 커뮤니티</title>
+<script src="/static/theme.js?v=10"></script>
+<link rel="stylesheet" href="/static/style.css?v=9"><link rel="stylesheet" href="/static/theme.css?v=10"><style id="homeQuickSearchStyle">.home-quick-search{display:grid;grid-template-columns:140px minmax(0,1fr) auto;gap:8px;max-width:650px;padding:9px;margin:26px 0 15px;background:var(--surface);border:1px solid var(--border);border-radius:13px;box-shadow:0 10px 30px #00000012}.home-quick-search select,.home-quick-search input{width:100%;min-width:0;margin:0;box-sizing:border-box;padding:14px 12px;background:var(--input-bg,var(--surface-2));border:1px solid var(--border);border-radius:8px;color:var(--text);font:inherit;font-size:13px}.home-quick-search input::placeholder{color:var(--muted)}.home-quick-search button{border:0;border-radius:8px;background:var(--accent);color:var(--on-accent,#fff);font:inherit;font-size:13px;font-weight:800;padding:12px 17px;white-space:nowrap;cursor:pointer}.home-quick-search :focus-visible{outline:2px solid var(--accent);outline-offset:2px}@media(max-width:600px){.home-quick-search{grid-template-columns:minmax(0,1fr) auto;margin-top:22px}.home-quick-search select{grid-column:1/-1;padding:11px 10px}.home-quick-search input{padding:13px 10px;font-size:12px}.home-quick-search button{padding:12px;font-size:12px}.home-hero-copy .home-actions{margin-top:13px}}</style></head>
+<body data-page="{{ active_page|default('home') }}">
+<header class="header"><a href="/" class="brand" aria-label="GAME.GG 홈"><svg class="controller" aria-hidden="true" width="30" height="30" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 9h12c3 0 5 3 6 7l1 7c.4 3-3 4-5 2l-4-4h-8l-4 4c-2 2-5.4 1-5-2l1-7c1-4 3-7 6-7Z"/><path d="M10 13v7m-3-3.5h6"/><circle cx="22" cy="14" r="1" fill="currentColor"/><circle cx="25" cy="18" r="1" fill="currentColor"/></svg> GAME.<b>GG</b></a>
+<nav aria-label="주 메뉴"><a href="/" data-nav="home">홈</a><a href="/search" data-nav="search">전적 검색</a><a href="/teams" data-nav="teams">팀원 모집</a><a href="/notices" data-nav="notices">공지사항</a></nav>
+<div id="themeControls" class="theme-controls" role="group" aria-label="화면 테마"><button type="button" data-theme-choice="dark" aria-pressed="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15.2A8.5 8.5 0 0 1 8.8 4 8.5 8.5 0 1 0 20 15.2Z"/></svg><span>다크</span></button><button type="button" data-theme-choice="light" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.4 1.4m11.2 11.2L19 19M5 19l1.4-1.4M17.6 6.4 19 5"/></svg><span>라이트</span></button></div></header>
+<main class="site-main">
+<section data-page-panel="home" class="page-home">
+ <div class="home-hero"><div class="container home-hero-grid"><div class="home-hero-copy"><span class="eyebrow">YOUR NEXT BATTLEGROUND</span><h1>한 판의 기록,<br>다음 판의 <em>가능성.</em></h1><p>나의 플레이를 돌아보고, 함께할 팀원을 만나세요.<br>전적 검색부터 팀원 모집까지 GAME.GG에서.</p><form id="homeQuickSearch" class="home-quick-search" action="/search" method="get" role="search" aria-label="홈 전적 검색"><select id="homePlatform" name="platform" aria-label="검색 플랫폼"><option value="steam">Steam (PC)</option><option value="kakao">Kakao</option><option value="psn">PlayStation</option><option value="xbox">Xbox</option></select><input id="homeNickname" name="nickname" type="text" required maxlength="32" placeholder="PUBG 닉네임을 입력하세요" aria-label="PUBG 닉네임" autocomplete="off" autocapitalize="none" spellcheck="false"><button type="submit">전적 검색</button></form><div class="home-actions"><a class="action-secondary" href="/teams">함께할 팀원 찾기</a></div><div class="home-platforms"><span data-platform-brand="steam">Steam</span><span data-platform-brand="kakao">Kakao</span><span data-platform-brand="psn">PlayStation</span><span data-platform-brand="xbox">Xbox</span></div></div><div class="home-hero-art" role="img" aria-label="PUBG 전장 캐릭터"></div></div></div>
+ <div class="container home-content"><div class="ad-slot ad-wide" data-ad-slot="home-top" aria-label="상단 광고 영역"><!-- 이 영역 안에 광고 코드를 삽입할 수 있습니다. --><span class="ad-label">ADVERTISEMENT</span><strong>광고 영역</strong><small>배너 광고를 위한 공간입니다.</small></div>
+ <div class="home-feature-grid"><a class="home-feature" href="/search"><span class="feature-number">01</span><h2>기록으로 보는 나의 플레이</h2><p>시즌 전적과 최근 경기, 팀별 순위까지 한눈에 확인하세요.</p><span class="feature-link">전적 검색 <b>↗</b></span></a><a class="home-feature" href="/teams"><span class="feature-number">02</span><h2>다음 치킨을 함께할 팀원</h2><p>듀오와 스쿼드, 나에게 맞는 조건으로 함께할 사람을 찾으세요.</p><span class="feature-link">팀원 모집 <b>↗</b></span></a><a class="home-feature" href="/notices"><span class="feature-number">03</span><h2>GAME.GG의 새로운 소식</h2><p>서비스 안내와 업데이트 소식을 공지사항에서 만나보세요.</p><span class="feature-link">공지사항 <b>↗</b></span></a></div>
+ <div class="home-community-grid"><div class="home-feed-stack"><section id="teams" class="panel"><div class="panel-head"><h2>함께할 팀원을 찾고 있어요</h2><button id="moreTeams" type="button" class="more more-button">모집글 전체 보기 ↗</button></div><div id="recentTeams" class="home-post-list">모집글을 불러오는 중입니다.</div></section><section id="notices" class="panel"><div class="panel-head"><h2>GAME.GG 소식</h2><button id="moreNotices" type="button" class="more more-button">공지 전체 보기 ↗</button></div><div id="recentNotices" class="home-post-list">공지사항을 불러오는 중입니다.</div></section></div><aside class="home-aside"><div class="ad-slot ad-square" data-ad-slot="home-side" aria-label="사이드 광고 영역"><!-- 정사각형 광고 코드를 삽입할 수 있습니다. --><span class="ad-label">ADVERTISEMENT</span><strong>광고 영역</strong><small>브랜드 · 이벤트 · 배너</small></div><div class="home-tip"><span class="eyebrow">PLAY TOGETHER</span><h3>좋은 팀플레이의 시작</h3><p>모집글에 플레이 시간과 선호 모드를 적으면 더 잘 맞는 팀원을 만날 수 있어요.</p><a href="/teams">모집글 작성하러 가기 →</a></div></aside></div>
+ <div class="ad-slot ad-wide" data-ad-slot="home-bottom" aria-label="하단 광고 영역"><!-- 하단 배너 광고 코드를 삽입할 수 있습니다. --><span class="ad-label">ADVERTISEMENT</span><strong>광고 영역</strong></div></div>
+</section>
+<section data-page-panel="search" class="page-search"><div class="search-page-hero"><div class="container search-page-head"><span class="eyebrow">PUBG STATS SEARCH</span><h1>전적 검색</h1><p>플랫폼을 선택하고, 나의 플레이를 확인하세요.</p><form id="searchForm" class="searchbar"><select id="platform" aria-label="플랫폼"><option value="steam">Steam (PC)</option><option value="kakao">Kakao</option><option value="psn">PlayStation</option><option value="xbox">Xbox</option></select><input id="nickname" required placeholder="PUBG 닉네임을 입력하세요." autocomplete="off"><button type="submit">전적 검색</button></form><div class="platform-choices" role="group" aria-label="검색 플랫폼 선택"><button type="button" data-platform-choice="steam" data-platform-brand="steam">Steam</button><button type="button" data-platform-choice="kakao" data-platform-brand="kakao">Kakao</button><button type="button" data-platform-choice="psn" data-platform-brand="psn">PlayStation</button><button type="button" data-platform-choice="xbox" data-platform-brand="xbox">Xbox</button></div><p class="subnote">PUBG 공식 API 기준 · 닉네임과 플랫폼을 정확하게 선택해 주세요.</p></div></div><div class="container search-page-content"><section id="search" class="results hidden"><div class="section-title"><h2 id="resultTitle">전적 검색 결과</h2><button id="closeResult" class="ghost">닫기 ×</button></div><div id="status" role="status"></div><div id="profile" class="profile"></div><section id="modeOverview" class="panel mode-overview" aria-label="모드별 시즌 전적"></section><div class="search-controls"><label>경쟁전 모드 <select id="rankMode"><option value="squad">스쿼드 3인칭</option><option value="squad-fpp">스쿼드 1인칭</option><option value="duo">듀오 3인칭</option><option value="duo-fpp">듀오 1인칭</option><option value="solo">솔로 3인칭</option><option value="solo-fpp">솔로 1인칭</option></select></label><label>시즌 조회 <select id="seasonLimit"><option value="6">최근 6시즌</option><option value="12">최근 12시즌</option><option value="100">전체 시즌</option></select></label></div><div class="visual-grid"><article class="panel season-trend"><div class="trend-heading"><div><span class="eyebrow">SEASON PROGRESS</span><h3>시즌 성장 기록</h3></div><div class="chart-tabs" role="group" aria-label="그래프 지표"><button id="chartRP" class="active" type="button">RP</button><button id="chartRounds" type="button">경기 수</button></div></div><div id="trendHighlights"></div><div id="seasonLoadStatus" class="season-load-status" role="status"></div><div id="rpGraph">검색 후 표시됩니다.</div><div id="roundGraph" hidden></div><p class="graph-note">공식 시즌 전적 기준 · 점에 마우스를 올려 기록을 확인하세요.</p></article><article class="panel"><h3>전투 성향 삼각 그래프</h3><div id="radarGraph">검색 후 표시됩니다.</div><p class="graph-note">최근 최대 20경기 텔레메트리 기준</p><form id="compareForm"><input id="compareName" required placeholder="비교할 닉네임"><button class="ghost">비교</button></form><p id="compareStatus"></p></article></div><article class="panel" id="currentMetrics"></article><article class="panel custom-tier-guide" id="customTierGuide"><div class="trend-heading"><div><span class="eyebrow">GAME.GG ORIGINAL</span><h3>우리만의 RP 티어표</h3></div><span class="scope-chip">GAME.GG 자체 등급</span></div><p class="graph-note">PUBG 공식 티어와 함께 나의 성장을 확인하세요.</p><div id="tierGuide" class="tier-grid"></div></article><article class="panel" id="recentSummary"></article><div class="result-grid"><article class="panel"><h3>최근 20경기 기록</h3><div id="matches" class="muted">검색 후 표시됩니다.</div></article><article class="panel"><h3>시즌별 전적</h3><div id="seasons" class="muted">검색 후 표시됩니다.</div></article><article class="panel"><h3>전투 성향</h3><div id="style" class="muted">검색 후 표시됩니다.</div></article></div></section>
+<section class="panel leaderboard"><div class="panel-head"><h2>🏆 실시간 TOP 10</h2><button id="loadLeaders" class="ghost">새로고침 ↻</button></div><div class="leader-controls"><label>플랫폼 <select id="leaderPlatform"><option value="steam">Steam</option><option value="kakao">Kakao</option><option value="psn">PlayStation</option><option value="xbox">Xbox</option></select></label><label>모드 <select id="leaderMode"><option value="squad">스쿼드 3인칭</option><option value="squad-fpp">스쿼드 1인칭</option><option value="duo">듀오 3인칭</option><option value="duo-fpp">듀오 1인칭</option><option value="solo">솔로 3인칭</option><option value="solo-fpp">솔로 1인칭</option></select></label></div><label>지역 <select id="leaderRegion"></select></label><div id="leaderStatus" class="graph-note"></div><div id="leaders" class="muted">PUBG API의 실제 순위를 불러올 수 있습니다.</div></section>
+</div></section>
+<section data-page-panel="community" class="page-community container"><div class="community-heading"><span class="eyebrow" id="boardEyebrow">COMMUNITY</span><h1 id="communityTitle">커뮤니티</h1><p id="communitySubtitle">GAME.GG에서 함께 나누는 이야기</p></div>
+<section id="boardFull" class="panel board-full"><div class="panel-head"><h2 id="boardTitle">게시판</h2><div class="board-heading-actions"><button id="adminLogout" type="button" class="ghost" hidden>관리자 로그아웃</button><button id="boardWriteButton" type="button" class="primary">글쓰기</button></div></div><div class="board-tabs" id="boardTabs"><button type="button" data-kind="duo">듀오 구함</button><button type="button" data-kind="squad">스쿼드 구함</button><button type="button" data-kind="notice">공지사항</button></div>
+<div id="boardListView"><div class="board-list-toolbar"><span id="boardCount">게시글을 불러오는 중입니다.</span><form id="boardSearchForm" class="board-search"><input id="boardQuery" maxlength="100" placeholder="제목 · 내용 · 작성자 검색" aria-label="게시글 검색"><button type="submit" class="ghost">검색</button><button id="boardClearSearch" type="button" class="ghost">초기화</button></form></div><div id="boardRows" class="board-rows">불러오는 중입니다.</div><nav id="boardPagination" class="board-pagination" aria-label="게시글 페이지"></nav></div>
+<article id="boardDetail" class="board-detail" hidden></article><div id="boardCompose" class="board-compose" hidden><div class="board-compose-heading"><h3 id="composeTitle">글 작성</h3><button type="button" id="boardClose" class="ghost">작성 취소</button></div><div id="boardFormWrap"><h3>모집글 작성</h3><form id="boardForm" class="board-form">
+<input id="postNickname" maxlength="32" required placeholder="작성자 닉네임 (2~32자)">
+<select id="postPlatform"><option value="steam">Steam</option><option value="kakao">Kakao</option><option value="psn">PSN</option><option value="xbox">Xbox</option></select>
+<select id="postMode"><option value="duo">듀오 3인칭</option><option value="duo-fpp">듀오 1인칭</option><option value="squad">스쿼드 3인칭</option><option value="squad-fpp">스쿼드 1인칭</option></select>
+<input id="postRp" type="number" min="0" max="15000" value="0" placeholder="최소 RP">
+<input id="postTitle" class="wide" maxlength="80" required placeholder="제목 (2~80자)">
+<textarea id="postBody" class="wide" rows="4" maxlength="1500" required placeholder="모집 내용 (5~1500자)"></textarea>
+<button type="submit" class="primary wide">글 등록하기</button></form></div>
+<div id="noticeFormWrap" class="hidden"><h3>관리자 공지 작성</h3><form id="noticeForm" class="board-form"><input id="noticeTitle" class="wide" maxlength="80" required placeholder="공지 제목"><textarea id="noticeBody" class="wide" rows="4" required maxlength="1500" placeholder="공지 내용"></textarea><button type="submit" class="primary wide">공지 등록</button></form></div>
+</div><p id="boardMessage" role="status"></p></section></section>
+</main><footer class="site-footer"><div class="container"><a class="footer-brand" href="/">GAME.GG</a><p>PUBG 전적 검색과 커뮤니티</p><nav aria-label="하단 메뉴"><a href="/search">전적 검색</a><a href="/teams">팀원 모집</a><a href="/notices">공지사항</a></nav><small>PUBG 및 관련 상표는 각 권리자에게 귀속됩니다.</small></div></footer>
+<script>window.GameggTheme && window.GameggTheme.init();</script><script src="/static/app.js?v=11"></script></body></html>

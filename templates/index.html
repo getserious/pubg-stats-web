@@ -1,0 +1,133 @@
+
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GAME.GG | 배틀그라운드 전적 검색</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { background: #0b0f19; color: #f1f5f9; font-family: Arial, sans-serif; }
+    .hero { background: linear-gradient(145deg, #101e35, #0b0f19); }
+    .stat { background: #172235; border: 1px solid #334155; border-radius: 14px; padding: 22px; }
+  </style>
+</head>
+<body>
+  <header class="border-b border-slate-800 bg-slate-900 p-5">
+    <div class="max-w-6xl mx-auto flex justify-between items-center">
+      <a href="/" class="text-3xl font-black text-white">GAME<span class="text-sky-400">.GG</span></a>
+      <span class="text-slate-400 text-sm">PUBG 전적 검색</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero py-24 px-4 text-center">
+      <div class="max-w-3xl mx-auto">
+        <p class="text-sky-400 font-bold mb-4">PLAYER STATISTICS</p>
+        <h1 class="text-4xl md:text-5xl font-black mb-5">배틀그라운드 전적 검색</h1>
+        <p class="text-slate-400 mb-10">닉네임을 입력하고 플레이어의 시즌 전적을 확인하세요.</p>
+
+        <form id="searchForm" class="bg-slate-800 border border-slate-700 rounded-2xl p-4 flex flex-col md:flex-row gap-3">
+          <select id="platform" class="bg-slate-900 rounded-lg p-4 text-white">
+            <option value="steam">STEAM</option>
+            <option value="kakao">KAKAO</option>
+          </select>
+          <input id="nickname" type="text" required
+                 placeholder="배틀그라운드 닉네임 입력"
+                 class="flex-1 bg-slate-900 rounded-lg p-4 outline-none focus:ring-2 focus:ring-sky-500">
+          <button id="searchButton" type="submit"
+                  class="bg-sky-600 hover:bg-sky-500 rounded-lg px-8 py-4 font-bold">
+            전적 검색
+          </button>
+        </form>
+
+        <p id="message" class="mt-6 text-slate-400" role="status"></p>
+      </div>
+    </section>
+
+    <section id="results" class="hidden max-w-6xl mx-auto px-4 py-12">
+      <div class="bg-slate-900 border border-slate-800 rounded-2xl p-8 mb-6">
+        <p class="text-sky-400 text-sm font-bold">PLAYER PROFILE</p>
+        <h2 id="playerName" class="text-3xl font-black mt-2"></h2>
+        <p id="playerPlatform" class="text-slate-400 mt-2"></p>
+      </div>
+
+      <h3 class="text-2xl font-bold mb-6">시즌 전적 요약</h3>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div class="stat"><p class="text-slate-400 mb-3">K/D</p><p id="kd" class="text-3xl font-black text-sky-400">-</p></div>
+        <div class="stat"><p class="text-slate-400 mb-3">승률</p><p id="winRate" class="text-3xl font-black">-</p></div>
+        <div class="stat"><p class="text-slate-400 mb-3">평균 피해량</p><p id="avgDamage" class="text-3xl font-black">-</p></div>
+        <div class="stat"><p class="text-slate-400 mb-3">경기 수</p><p id="matches" class="text-3xl font-black">-</p></div>
+      </div>
+      <p id="statsNotice" class="text-slate-500 text-sm mt-5"></p>
+    </section>
+  </main>
+
+  <footer class="border-t border-slate-800 text-center text-slate-500 py-8 text-sm">
+    © 2026 GAME.GG · PUBG Statistics Project
+  </footer>
+
+  <script>
+    const form = document.getElementById("searchForm");
+    const message = document.getElementById("message");
+    const results = document.getElementById("results");
+    const button = document.getElementById("searchButton");
+
+    function pick(obj, keys) {
+      for (const key of keys) {
+        if (obj && obj[key] !== undefined && obj[key] !== null) return obj[key];
+      }
+      return null;
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const nickname = document.getElementById("nickname").value.trim();
+      const platform = document.getElementById("platform").value;
+      if (!nickname) return;
+
+      results.classList.add("hidden");
+      button.disabled = true;
+      button.textContent = "검색 중...";
+      message.textContent = "PUBG 데이터를 불러오고 있습니다.";
+
+      try {
+        const url = `/api/player?nickname=${encodeURIComponent(nickname)}&platform=${encodeURIComponent(platform)}`;
+        const response = await fetch(url);
+        const data = await response.json();
+
+        if (!response.ok || data.ok === false || data.error) {
+          throw new Error(data.error || data.message || "플레이어 검색에 실패했습니다.");
+        }
+
+        const stats = data.summary || data.stats || data.statistics || {};
+        document.getElementById("playerName").textContent = data.nickname || nickname;
+        document.getElementById("playerPlatform").textContent = platform.toUpperCase();
+
+        const kd = pick(stats, ["kd", "k_d", "kdr"]);
+        const winRate = pick(stats, ["win_rate", "winRate"]);
+        const damage = pick(stats, ["avg_damage", "avgDamage", "averageDamage"]);
+        const matches = pick(stats, ["matches", "roundsPlayed", "games"]);
+
+        document.getElementById("kd").textContent = kd ?? "-";
+        document.getElementById("winRate").textContent =
+          winRate == null ? "-" : String(winRate).includes("%") ? winRate : winRate + "%";
+        document.getElementById("avgDamage").textContent = damage ?? "-";
+        document.getElementById("matches").textContent = matches ?? "-";
+        document.getElementById("statsNotice").textContent =
+          [kd, winRate, damage, matches].every(v => v == null)
+            ? "플레이어를 찾았지만 현재 표시 가능한 시즌 통계가 없습니다."
+            : "";
+
+        results.classList.remove("hidden");
+        message.textContent = "검색이 완료되었습니다.";
+      } catch (error) {
+        message.textContent = "오류: " + error.message;
+      } finally {
+        button.disabled = false;
+        button.textContent = "전적 검색";
+      }
+    });
+  </script>
+</body>
+</html>

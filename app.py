@@ -9,9 +9,11 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import requests
+from werkzeug.security import generate_password_hash, check_password_hash
+AUTH_DUMMY_HASH = generate_password_hash(secrets.token_hex(24))
 from gamegg_config import BUILD, load_configuration, print_config_summary, normalize_admin_path
 from flask import Flask, jsonify, render_template, render_template_string, request, send_file, session
 
@@ -92,6 +94,7 @@ def private_admin_login(secret_path):
 BASE = 'https://api.pubg.com/shards'
 DB = Path(os.getenv('GAMEGG_CACHE_DB', str(ROOT / 'cache.sqlite3')))
 LOCK = threading.RLock()
+CACHE_STAGE = threading.local()
 SHARDS = ('steam', 'kakao', 'psn', 'xbox')
 REGIONS = {'steam': ('pc-as','pc-eu','pc-jp','pc-krjp','pc-na','pc-oc','pc-ru','pc-sa','pc-sea'), 'kakao': ('pc-kakao',), 'psn': ('psn-as','psn-eu','psn-na','psn-oc'), 'xbox': ('xbox-as','xbox-eu','xbox-na','xbox-oc','xbox-sa')}
 API_SHARDS = set(SHARDS) | {r for rs in REGIONS.values() for r in rs}
@@ -106,6 +109,7 @@ class PUBGError(Exception):
 def db_conn():
     db = sqlite3.connect(DB, timeout=15)
     db.execute('CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires REAL NOT NULL)')
+    db.execute('CREATE TABLE IF NOT EXISTS cache_metadata (key TEXT PRIMARY KEY, updated_at REAL NOT NULL)')
     return db
 
 
@@ -116,15 +120,30 @@ def cache_get(key):
 
 
 def cache_set(key, value, ttl):
+    pending = getattr(CACHE_STAGE, 'pending', None)
+    if pending is not None:
+        pending[key] = (value, ttl)
+        return
     with LOCK, db_conn() as db:
         db.execute('INSERT OR REPLACE INTO cache VALUES (?,?,?)', (key, json.dumps(value, ensure_ascii=False), time.time()+ttl))
+        db.execute('INSERT OR REPLACE INTO cache_metadata VALUES (?,?)', (key, time.time()))
 
 
-def api_get(shard, path, *, params=None, ttl=0, authenticated=True):
+def api_cache_key(shard, path, params=None):
+    return 'api:' + shard + ':' + path + ':' + json.dumps(params or {}, sort_keys=True)
+
+
+def cache_updated_at(key):
+    with LOCK, db_conn() as db:
+        row = db.execute('SELECT m.updated_at FROM cache_metadata m JOIN cache c ON m.key=c.key WHERE m.key=? AND c.expires>?', (key, time.time())).fetchone()
+    return row[0] if row else None
+
+
+def api_get(shard, path, *, params=None, ttl=0, authenticated=True, force=False):
     if shard not in API_SHARDS or not re.fullmatch(r'[A-Za-z0-9_./-]+', path):
         raise PUBGError('잘못된 요청 경로입니다.', 'INVALID_INPUT')
-    key = 'api:' + shard + ':' + path + ':' + json.dumps(params or {}, sort_keys=True)
-    if ttl:
+    key = api_cache_key(shard, path, params)
+    if ttl and not force:
         saved = cache_get(key)
         if saved is not None:
             return saved
@@ -183,7 +202,7 @@ def account_from_payload(payload, shard):
     return {'account_id':item['id'], 'nickname':item.get('attributes',{}).get('name',''), 'platform':shard, 'reported_platform':reported, 'match_ids':match_ids}
 
 
-def lookup(nickname, shard):
+def lookup(nickname, shard, *, force=False):
     if not nickname or len(nickname)>80 or any(ord(c)<32 for c in nickname):
         raise PUBGError('닉네임을 확인해 주세요.', 'INVALID_INPUT')
     if shard not in SHARDS:
@@ -191,14 +210,14 @@ def lookup(nickname, shard):
     shards = (shard,)  # 다른 플랫폼으로 자동 검색하지 않음
     for s in shards:
         key = f'player:v2:{s}:{nickname.casefold()}'
-        cached = cache_get(key)
+        cached = None if force else cache_get(key)
         if cached is not None and cached.get('platform') == s and cached.get('nickname','').casefold() == nickname.casefold():
             return cached
         try:
-            player = account_from_payload(api_get(s, 'players', params={'filter[playerNames]':nickname}, ttl=120), s)
+            player = account_from_payload(api_get(s, 'players', params={'filter[playerNames]':nickname}, ttl=PLAYER_CACHE_TTL, force=force), s)
             if player['platform'] != s or player['nickname'].casefold() != nickname.casefold():
                 raise PUBGError('선택한 플랫폼에서 해당 닉네임이 조회되지 않습니다. 올바른 플랫폼으로 다시 검색해 주세요.', 'NOT_FOUND', 404)
-            cache_set(key, player, 120)
+            cache_set(key, player, PLAYER_CACHE_TTL)
             return player
         except PUBGError as e:
             if e.code != 'NOT_FOUND': raise
@@ -220,10 +239,10 @@ def seasons_for(shard):
     return sorted(unique.values(),key=lambda item:(item['current'],int(item['number']) if item['number'].isdigit() else -1),reverse=True)
 
 
-def player_stats(shard, player_id, season_id, ranked=False):
+def player_stats(shard, player_id, season_id, ranked=False, *, force=False):
     path = f'players/{quote(player_id,safe="")}/seasons/{quote(season_id,safe="")}'
     if ranked: path += '/ranked'
-    payload = api_get(shard, path, ttl=600)
+    payload = api_get(shard, path, ttl=STATS_CACHE_TTL, force=force)
     attrs = (payload.get('data') or {}).get('attributes') or {}
     validate_reported_platform(attrs, shard)
     return attrs.get('rankedGameModeStats' if ranked else 'gameModeStats') or {}
@@ -339,23 +358,130 @@ def has_rounds(section):
     return section.get('available') and any(isinstance(stats,dict) and float(stats.get('roundsPlayed') or 0)>0 for stats in (section.get('data') or {}).values())
 
 
+# Player refresh metadata and cooldown live in SQLite so workers share the limit.
+PLAYER_CACHE_TTL = 1800
+STATS_CACHE_TTL = 1800
+REFRESH_COOLDOWN = 120
+REFRESH_LEASE = 180
+
+
+def refresh_conn():
+    db = db_conn()
+    db.execute('CREATE TABLE IF NOT EXISTS player_refresh (key TEXT PRIMARY KEY, last_success REAL, next_allowed REAL NOT NULL DEFAULT 0, lease_until REAL NOT NULL DEFAULT 0, token TEXT)')
+    return db
+
+
+def refresh_key(nickname, platform):
+    return platform + ':' + nickname.casefold()
+
+
+def refresh_metadata(nickname, platform, fetched_at=None):
+    now = time.time()
+    with LOCK, refresh_conn() as db:
+        row = db.execute('SELECT last_success,next_allowed,lease_until FROM player_refresh WHERE key=?', (refresh_key(nickname, platform),)).fetchone()
+    return {'fetched_at': fetched_at or (row[0] if row else None),
+            'next_allowed_at': max(row[1], row[2]) if row else 0,
+            'server_time': now, 'cooldown_seconds': REFRESH_COOLDOWN,
+            'cache_ttl_seconds': PLAYER_CACHE_TTL,
+            'refreshing': bool(row and row[2] > now)}
+
+
+def claim_refresh(nickname, platform):
+    now = time.time(); key = refresh_key(nickname, platform); token = secrets.token_hex(16)
+    with LOCK, refresh_conn() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute('SELECT next_allowed,lease_until FROM player_refresh WHERE key=?', (key,)).fetchone()
+        if row and max(row) > now:
+            wait = max(1, int(max(row) - now) + 1)
+            raise PUBGError('정보 갱신 대기시간입니다. 잠시 후 다시 시도해 주세요.', 'REFRESH_COOLDOWN', retry_after=wait)
+        db.execute('INSERT INTO player_refresh(key,next_allowed,lease_until,token) VALUES(?,?,?,?) ON CONFLICT(key) DO UPDATE SET next_allowed=excluded.next_allowed,lease_until=excluded.lease_until,token=excluded.token', (key, now + REFRESH_COOLDOWN, now + REFRESH_LEASE, token))
+    return token
+
+
+def finish_refresh(nickname, platform, token, success=False, retry_after=None):
+    now = time.time()
+    try: wait = max(REFRESH_COOLDOWN, min(3600, int(float(retry_after or 0))))
+    except (ValueError, TypeError): wait = REFRESH_COOLDOWN
+    with LOCK, refresh_conn() as db:
+        db.execute('UPDATE player_refresh SET last_success=CASE WHEN ? THEN ? ELSE last_success END,next_allowed=?,lease_until=0,token=NULL WHERE key=? AND token=?', (bool(success), now, now + wait, refresh_key(nickname, platform), token))
+
+
+def profile_payload(p, *, force=False):
+    all_seasons = seasons_for(p['platform'])
+    current = next((s for s in all_seasons if s['current']), None)
+    if force:
+        # Stop at the first failure. Never mark a partially refreshed profile as successful.
+        ranked = {'available': True, 'data': player_stats(p['platform'], p['account_id'], current['id'], True, force=True)} if current else {'available': False, 'data': None, 'reason': '현재 시즌 없음'}
+        normal = {'available': True, 'data': player_stats(p['platform'], p['account_id'], current['id'], force=True)} if current else {'available': False, 'data': None, 'reason': '현재 시즌 없음'}
+    else:
+        ranked = safe_section(lambda: player_stats(p['platform'], p['account_id'], current['id'], True)) if current else {'available': False, 'data': None, 'reason': '현재 시즌 없음'}
+        normal = safe_section(lambda: player_stats(p['platform'], p['account_id'], current['id'])) if current else {'available': False, 'data': None, 'reason': '현재 시즌 없음'}
+    for section in (ranked, normal):
+        if section.get('code') == 'PLATFORM_MISMATCH': raise PUBGError(section['reason'], 'PLATFORM_MISMATCH', 404)
+    records = bool(p.get('match_ids')) or bool(has_rounds(ranked) or has_rounds(normal))
+    failed = not ranked.get('available') or not normal.get('available')
+    message = '' if records else (f"{PLATFORM_NAMES[p['platform']]}에서 이 닉네임의 전적을 확인할 수 없습니다. 플랫폼과 시즌을 확인해 주세요. " + ('전적 조회 요청이 실패했습니다.' if failed else '현재 시즌 기록과 최근 경기 목록이 없습니다. 과거 시즌 기록은 별도로 확인할 수 있습니다.'))
+    # This timestamp describes the oldest required source response, not the page-open time.
+    keys = [api_cache_key(p['platform'], 'players', {'filter[playerNames]': p['nickname']})]
+    if current:
+        base = f"players/{quote(p['account_id'],safe='')}/seasons/{quote(current['id'],safe='')}"
+        keys.extend([api_cache_key(p['platform'], base), api_cache_key(p['platform'], base + '/ranked')])
+    times = [cache_updated_at(k) for k in keys]
+    fetched = min(times) if all(times) else None
+    return {'player': {k:v for k,v in p.items() if k != 'match_ids'}, 'current_season': current, 'seasons': all_seasons, 'ranked': ranked, 'normal': normal, 'records_available': records, 'record_status': 'AVAILABLE' if records else 'QUERY_FAILED' if failed else 'NO_CURRENT_RECORDS', 'platform_message': message,
+            'refresh': refresh_metadata(p['nickname'], p['platform'], fetched)}
+
+
+@app.post('/api/profile/refresh')
+def refresh_profile():
+    nickname = ''; platform = ''; token = None
+    try:
+        origin = request.headers.get('Origin')
+        if origin and urlsplit(origin).netloc.lower() != request.host.lower():
+            raise PUBGError('다른 사이트에서 보낸 갱신 요청은 허용하지 않습니다.', 'INVALID_ORIGIN')
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict): raise PUBGError('갱신 요청을 확인해 주세요.', 'INVALID_INPUT')
+        nickname = str(data.get('nickname', '')).strip(); platform = str(data.get('platform', '')).strip().lower()
+        if platform not in SHARDS or not nickname or len(nickname)>80 or any(ord(c)<32 for c in nickname):
+            raise PUBGError('닉네임과 플랫폼을 확인해 주세요.', 'INVALID_INPUT')
+        selected = str(data.get('season') or '').strip()
+        if selected and selected not in {x['id'] for x in seasons_for(platform)}:
+            raise PUBGError('시즌 목록에 없는 ID입니다.', 'INVALID_INPUT')
+        token = claim_refresh(nickname, platform)
+        CACHE_STAGE.pending = {}
+        player = lookup(nickname, platform, force=True)
+        result = profile_payload(player, force=True)
+        if selected and selected != (result.get('current_season') or {}).get('id'):
+            result['selected_season'] = {'id': selected,
+                'ranked': {'available': True, 'data': player_stats(platform, player['account_id'], selected, True, force=True)},
+                'normal': {'available': True, 'data': player_stats(platform, player['account_id'], selected, force=True)}}
+        pending = CACHE_STAGE.pending
+        CACHE_STAGE.pending = None
+        # Publish all refreshed source data together. A failed refresh keeps the old cache.
+        with LOCK, db_conn() as db:
+            saved_at = time.time()
+            for key, (value, ttl) in pending.items():
+                db.execute('INSERT OR REPLACE INTO cache VALUES (?,?,?)', (key,json.dumps(value,ensure_ascii=False),saved_at+ttl))
+                db.execute('INSERT OR REPLACE INTO cache_metadata VALUES (?,?)', (key,saved_at))
+        finish_refresh(nickname, platform, token, success=True)
+        result['refresh'] = refresh_metadata(nickname, platform)
+        return response_ok(result)
+    except PUBGError as e:
+        if token: finish_refresh(nickname, platform, token, retry_after=e.retry_after)
+        meta = refresh_metadata(nickname, platform) if nickname and platform in SHARDS else None
+        return jsonify(ok=False, error=str(e), code=e.code, retry_after=e.retry_after, refresh=meta), 200
+    except Exception:
+        if token: finish_refresh(nickname, platform, token)
+        app.logger.exception('Profile refresh failed')
+        return jsonify(ok=False,error='갱신에 실패했습니다. 기존 화면의 기록은 유지됩니다.',code='INTERNAL_ERROR',refresh=refresh_metadata(nickname,platform) if nickname and platform in SHARDS else None),200
+
+    finally:
+        CACHE_STAGE.pending = None
+
+
 @app.get('/api/profile')
 def profile():
-    def run():
-        p = query_player()
-        all_seasons = seasons_for(p['platform'])
-        current = next((s for s in all_seasons if s['current']),None)
-        ranked=safe_section(lambda: player_stats(p['platform'],p['account_id'],current['id'],True)) if current else {'available':False,'data':None,'reason':'현재 시즌 없음'}
-        normal=safe_section(lambda: player_stats(p['platform'],p['account_id'],current['id'])) if current else {'available':False,'data':None,'reason':'현재 시즌 없음'}
-        for section in (ranked,normal):
-            if section.get('code')=='PLATFORM_MISMATCH':
-                raise PUBGError(section['reason'],'PLATFORM_MISMATCH',404)
-        records=bool(p.get('match_ids')) or bool(has_rounds(ranked) or has_rounds(normal))
-        failed=not ranked.get('available') or not normal.get('available')
-        message='' if records else (f"{PLATFORM_NAMES[p['platform']]}에서 이 닉네임의 전적을 확인할 수 없습니다. 플랫폼과 시즌을 확인해 주세요. " + ('전적 조회 요청이 실패했습니다.' if failed else '현재 시즌 기록과 최근 경기 목록이 없습니다. 과거 시즌 기록은 별도로 확인할 수 있습니다.'))
-        return {'player':{k:v for k,v in p.items() if k!='match_ids'},'current_season':current,'seasons':all_seasons,'ranked':ranked,'normal':normal,
-                'records_available':records,'record_status':'AVAILABLE' if records else 'QUERY_FAILED' if failed else 'NO_CURRENT_RECORDS','platform_message':message}
-    return endpoint(run)
+    return endpoint(lambda: profile_payload(query_player()))
 
 @app.get('/api/season')
 def season():
@@ -479,7 +605,7 @@ def match_telemetry():
         parsed = urlparse(url)
         if parsed.scheme != 'https' or not parsed.hostname or not (parsed.hostname == 'telemetry-cdn.pubg.com' or parsed.hostname.endswith('.telemetry-cdn.pubg.com')):
             raise PUBGError('텔레메트리 URL을 검증할 수 없습니다.', 'BAD_TELEMETRY_URL')
-        cache_key = 'killlog:v5:complete:' + platform + ':' + match_id + ':' + player['account_id']
+        cache_key = 'killlog:v6:combat:' + platform + ':' + match_id + ':' + player['account_id']
         cached = cache_get(cache_key)
         if cached is not None: return cached
         try:
@@ -555,7 +681,7 @@ def match_telemetry():
             if same(victim):
                 source = killer if killer else finisher
                 deaths.append({'killer':actor(source),'weapon':weapon or '정보 없음','weapon_code':weapon_code,'headshot':headshot,'distance':distance,'time':event.get('_D'),'suicide':bool(event.get('isSuicide')),'elapsed_seconds':round(timestamp(event.get('_D'))-start,1) if start is not None and timestamp(event.get('_D')) is not None else None})
-        result = {'match_id':match_id,'nickname':player['nickname'],'platform':platform,'kills':kills,'deaths':deaths,'events_checked':len(events),'match_killfeed':match_killfeed}
+        result = {'match_id':match_id,'nickname':player['nickname'],'platform':platform,'kills':kills,'deaths':deaths,'events_checked':len(events),'match_killfeed':match_killfeed,'style_features':combat_features(events,player['account_id'])}
         cache_set(cache_key,result,3600)
         return result
     return endpoint(run)
@@ -582,43 +708,150 @@ def weapon_icon(code):
     return ('',404)
 
 
+PLAYSTYLE_VERSION = 'combat-v2'
+
+
+def combat_features(events, account_id):
+    """Extract enemy combat only. Preserve kill-feed rendering independently."""
+    from datetime import datetime
+    import math
+    def stamp(value):
+        try: return datetime.fromisoformat(str(value).replace('Z','+00:00')).timestamp()
+        except (TypeError,ValueError,OverflowError): return None
+    def number(value):
+        try:
+            if isinstance(value,bool): return None
+            result=float(value)
+            return result if math.isfinite(result) and result>=0 else None
+        except (TypeError,ValueError): return None
+    def who(value):return value.get('accountId') if isinstance(value,dict) else None
+    def enemy(a,b):
+        if not who(a) or not who(b) or who(a)==who(b):return False
+        at=a.get('teamId');bt=b.get('teamId')
+        return at is None or bt is None or at!=bt
+    starts=[stamp(e.get('_D')) for e in events if isinstance(e,dict) and e.get('_T')=='LogMatchStart']
+    start=next((v for v in starts if v is not None),None)
+    result={'version':PLAYSTYLE_VERSION,'complete':False,'reason':'경기 시작 시각 또는 플레이어 정보 부족',
+        'early_damage':0.0,'early_damage_taken':0.0,'first7_damage':0.0,'first7_damage_taken':0.0,
+        'later_damage':0.0,'later_damage_taken':0.0,'first_combat_seconds':None,
+        'early_knocks':0,'early_kills':0,'early_successes':0,'first7_successes':0}
+    if start is None:return result
+    target_seen=False;invalid=False;ordered=[]
+    for index,e in enumerate(events):
+        if not isinstance(e,dict):continue
+        if e.get('_T')=='LogMatchStart':
+            target_seen=target_seen or any(who(c.get('character',c))==account_id for c in e.get('characters',[]) if isinstance(c,dict))
+        actors=[e.get(k) for k in ('attacker','victim','killer','finisher','character','dBNOMaker')]
+        relevant=any(who(a)==account_id for a in actors)
+        target_seen=target_seen or relevant
+        t=stamp(e.get('_D'))
+        if relevant and e.get('_T') in ('LogPlayerTakeDamage','LogPlayerMakeGroggy','LogPlayerKill','LogPlayerKillV2') and t is None:invalid=True
+        if t is not None and t>=start:ordered.append((t,index,e))
+    downed={};seen_actions=set();early_targets=set();first7_targets=set();first=None
+    for timestamp,index,e in sorted(ordered,key=lambda item:(item[0],item[1])):
+        elapsed=timestamp-start;kind=e.get('_T');a=e.get('attacker') or {};v=e.get('victim') or {};vid=who(v)
+        if kind=='LogPlayerRevive':downed.pop(vid,None);continue
+        if kind=='LogPlayerRedeploy':downed.pop(who(e.get('character')),None);continue
+        if kind=='LogPlayerTakeDamage':
+            if not enemy(a,v):continue
+            own=who(a)==account_id;received=vid==account_id
+            if not(own or received):continue
+            dmg=number(e.get('damage'))
+            if dmg is None:invalid=True;continue
+            if dmg<=0:continue
+            # Damage after a knock is finishing damage, not fresh combat contribution.
+            if vid in downed and timestamp>downed[vid]:continue
+            first=elapsed if first is None else min(first,elapsed)
+            if elapsed<=300:result['early_damage' if own else 'early_damage_taken']+=dmg
+            else:result['later_damage' if own else 'later_damage_taken']+=dmg
+            if elapsed<=420:result['first7_damage' if own else 'first7_damage_taken']+=dmg
+        elif kind=='LogPlayerMakeGroggy':
+            if vid:downed[vid]=timestamp
+            if enemy(a,v) and (who(a)==account_id or vid==account_id):first=elapsed if first is None else min(first,elapsed)
+            if who(a)==account_id and enemy(a,v):
+                first=elapsed if first is None else min(first,elapsed)
+                if elapsed<=420:first7_targets.add(vid)
+                key=('knock',vid,e.get('dBNOId',e.get('attackId',timestamp)))
+                if elapsed<=300 and key not in seen_actions:
+                    result['early_knocks']+=1;early_targets.add(vid);seen_actions.add(key)
+        elif kind in ('LogPlayerKill','LogPlayerKillV2'):
+            killer=e.get('killer') or {}
+            if enemy(killer,v) and (who(killer)==account_id or vid==account_id):first=elapsed if first is None else min(first,elapsed)
+            if who(killer)==account_id and enemy(killer,v) and not e.get('isSuicide'):
+                first=elapsed if first is None else min(first,elapsed)
+                if elapsed<=420:first7_targets.add(vid)
+                # Legacy/V2 duplicate credit and knock+finish of the same target do not stack bonuses.
+                if elapsed<=300 and vid not in {x[1] for x in seen_actions if x[0]=='kill'}:
+                    result['early_kills']+=1;early_targets.add(vid);seen_actions.add(('kill',vid))
+    result['early_successes']=len(early_targets)
+    result['first7_successes']=len(first7_targets)
+    result['first_combat_seconds']=round(first,1) if first is not None else None
+    result['complete']=bool(target_seen and not invalid)
+    result['reason']='' if result['complete'] else '피해 이벤트 시각/수치 또는 플레이어 정보가 부족합니다.'
+    for key in ('early_damage','early_damage_taken','first7_damage','first7_damage_taken','later_damage','later_damage_taken'):
+        result[key]=round(result[key],2)
+    return result
+
+
+def score_combat(features, survival):
+    """Project heuristic scores, not a calibrated skill rating."""
+    import math
+    if not features.get('complete') or features.get('version')!=PLAYSTYLE_VERSION:return None
+    try:duration=float(survival)
+    except (ValueError,TypeError):return None
+    if not math.isfinite(duration) or duration<=0:return None
+    def cap(value):return min(1.0,max(0.0,float(value)))
+    damage=cap(features['early_damage']/400)
+    first=features['first_combat_seconds']
+    quick=cap(1-first/300) if first is not None else 0
+    successes=cap(features['early_successes']/2)
+    aggression=100*(.6*damage+.2*quick+.2*successes)
+    passive=None;balanced=None
+    if duration>=420:
+        delay=cap(first/420) if first is not None else 1
+        quiet=0 if features.get('first7_successes',0)>0 else 1-cap((features['first7_damage']+features['first7_damage_taken'])/200)
+        passive=100*delay*quiet
+        # Balance requires actual outgoing combat both before and after five minutes.
+        early_presence=cap(features['early_damage']/100)
+        later_presence=cap(features['later_damage']/400)
+        survival_factor=cap(duration/900)
+        moderation=1-abs(aggression-50)/50
+        balanced=100*cap(moderation)*(.4*early_presence+.4*later_presence+.2*survival_factor) if early_presence>0 and later_presence>0 else 0
+    return {'yeopo':round(aggression,2),'jonbeo':None if passive is None else round(passive,2),'balance':None if balanced is None else round(balanced,2)}
+
+
 def playstyle_for(nickname, platform, limit=20):
-    player=lookup(nickname,platform)
-    matches=(player.get('match_ids') or [])[:limit]
-    if not matches: raise PUBGError('최근 경기 기록이 없습니다.','NO_MATCHES')
-    from flask import current_app
-    # Reuse the authenticated, validated telemetry endpoint and its cache.
-    early=0; passive=0; observed=0; errors=0; early_kills_total=0
+    player=lookup(nickname,platform);matches=list(dict.fromkeys(player.get('match_ids') or []))[:min(20,limit)]
+    if not matches:raise PUBGError('최근 경기 기록이 없습니다.','NO_MATCHES')
+    samples=[];errors=0
     for mid in matches:
         try:
             with app.test_request_context('/api/match-telemetry',query_string={'match_id':mid,'nickname':nickname,'platform':platform}):
-                response=match_telemetry()
-                result=response[0].get_json() if isinstance(response,tuple) else response.get_json()
-            if not result.get('ok'): errors+=1;continue
-            times=[x.get('elapsed_seconds') for x in result.get('kills',[]) if isinstance(x.get('elapsed_seconds'),(int,float))]
-            if not times: 
-                # Zero kills qualifies for passive only if match survived 7 min.
-                pass
+                response=match_telemetry();result=response[0].get_json() if isinstance(response,tuple) else response.get_json()
+            if not result.get('ok'):errors+=1;continue
+            features=result.get('style_features') or {}
             match=api_get(platform,'matches/'+quote(mid,safe=''),ttl=1800,authenticated=False)
             detail=parse_match(match,player['account_id'])
-            if not detail: errors+=1;continue
-            duration=float(detail.get('survival') or 0)
-            if not times and result.get('kills'):
-                errors+=1;continue
-            if result.get('kills') and len(times)!=len(result['kills']): errors+=1;continue
-            first5=sum(1 for t in times if 0<=t<=300)
-            early_kills_total+=first5
-            if first5>=5: early+=1
-            if duration>=420 and not any(t<=420 for t in times): passive+=1
-            observed+=1
-        except (PUBGError, ValueError, TypeError, KeyError): errors+=1
-    if not observed: raise PUBGError('분석 가능한 텔레메트리 경기가 없습니다.','NO_STYLE_DATA')
-    # 0..100 scores: per-match frequency; balance rewards having BOTH patterns.
-    a=round(15+85*early/observed,1); b=round(15+85*passive/observed,1)
-    balance=round(min(a,b),1)
-    return {'nickname':player['nickname'],'platform':platform,'matches_analyzed':observed,'matches_requested':len(matches),'matches_failed':errors,
-            'early_matches':early,'passive_matches':passive,'early_kills_total':early_kills_total,
-            'scores':{'yeopo':a,'jonbeo':b,'balance':balance},'base_score':15,'definition':'기본점수 15점. 여포: 경기 시작 5분 이내 5킬 이상인 경기 비율; 존버: 7분 이상 생존하고 7분 내 0킬인 경기 비율; 밸런스: 두 비율 중 작은 값'}
+            scores=score_combat(features,detail.get('survival') if detail else None)
+            if scores is None:errors+=1;continue
+            samples.append({'match_id':mid,'scores':scores,'early_damage':features['early_damage'],
+                'first_combat_seconds':features['first_combat_seconds'],'early_knocks':features['early_knocks'],
+                'early_kills':features['early_kills'],'survival':detail.get('survival')})
+        except (PUBGError,ValueError,TypeError,KeyError):errors+=1
+    if not samples:raise PUBGError('분석 가능한 피해/교전 텔레메트리가 없습니다.','NO_STYLE_DATA')
+    axes=('yeopo','jonbeo','balance');counts={k:sum(s['scores'][k] is not None for s in samples) for k in axes}
+    # Short matches contribute to aggression but not to passive/balanced classification.
+    scores={k:round(15+85*(sum(s['scores'][k] for s in samples if s['scores'][k] is not None)/counts[k])/100,1) if counts[k] else 15.0 for k in axes}
+    firsts=[s['first_combat_seconds'] for s in samples if s['first_combat_seconds'] is not None]
+    return {'nickname':player['nickname'],'platform':platform,'algorithm_version':PLAYSTYLE_VERSION,
+        'matches_analyzed':len(samples),'matches_requested':len(matches),'matches_failed':errors,
+        'axis_matches':counts,'axis_available':{k:counts[k]>0 for k in axes},'base_score':15,'scores':scores,
+        'early_damage_average':round(sum(s['early_damage'] for s in samples)/len(samples),1),
+        'first_combat_average':round(sum(firsts)/len(firsts),1) if firsts else None,
+        'early_kills_total':sum(s['early_kills'] for s in samples),'early_knocks_total':sum(s['early_knocks'] for s in samples),
+        'match_samples':samples,
+        'definition':'여포: 초반 5분 가한 피해 60%, 첫 교전 시점 20%, 기절·처치한 서로 다른 상대 20%. 존버: 7분 이상 생존한 경기의 첫 교전 지연과 적에게 가한·받은 피해 부족. 밸런스: 7분 이상 생존하며 초반과 5분 이후 모두 공격에 참여한 균형. 경기별 점수 평균에 기본점수 15 적용.',
+        'thresholds':{'early_window_seconds':300,'passive_min_survival_seconds':420,'damage_full_score':400,'success_targets_full_score':2,'passive_damage_scale':200,'balanced_survival_scale':900}}
 
 @app.get('/api/playstyle')
 def playstyle():
@@ -643,14 +876,15 @@ def playstyle():
         result['peer_average']=None;result['peer_count']=0
         if rp is not None:
             rp=float(rp)
-            key='style-sample:'+platform+':'+selected_mode+':'+p['account_id']
-            cache_set(key,{'nickname':p['nickname'],'rp':rp,'scores':result['scores'],'platform':platform},86400)
+            key='style-sample:'+PLAYSTYLE_VERSION+':'+platform+':'+selected_mode+':'+p['account_id']
+            cache_set(key,{'nickname':p['nickname'],'rp':rp,'scores':result['scores'],'platform':platform,'algorithm_version':PLAYSTYLE_VERSION,'axis_available':result['axis_available']},86400)
             with LOCK,db_conn() as db:
-                rows=db.execute("SELECT value FROM cache WHERE key LIKE ? AND expires>?",('style-sample:'+platform+':'+selected_mode+':%',time.time())).fetchall()
+                rows=db.execute("SELECT value FROM cache WHERE key LIKE ? AND expires>?",('style-sample:'+PLAYSTYLE_VERSION+':'+platform+':'+selected_mode+':%',time.time())).fetchall()
             peers=[]
             for row in rows:
                 try: sample=json.loads(row[0])
                 except ValueError: continue
+                if sample.get('algorithm_version')!=PLAYSTYLE_VERSION or not all(sample.get('axis_available',{}).values()):continue
                 if sample.get('nickname','').casefold()==p['nickname'].casefold():continue
                 if abs(float(sample.get('rp',-999999))-rp)<=500: peers.append(sample['scores'])
             result['peer_count']=len(peers)
@@ -708,84 +942,314 @@ def match_detail():
 
 
 
-# GAME.GG community: server-side validation and persistent SQLite storage.
+# Community membership and recruiting lifecycle.
 BOARD_KINDS = ('notice', 'duo', 'squad')
+RECRUIT_SECONDS = 30 * 60
+
+
 def board_conn():
-    db=sqlite3.connect(DB,timeout=15)
-    db.row_factory=sqlite3.Row
-    db.execute("""CREATE TABLE IF NOT EXISTS community_posts (
+    db = sqlite3.connect(DB, timeout=15)
+    db.row_factory = sqlite3.Row
+    # Serialize migration between WSGI workers without replacing existing data.
+    db.execute('BEGIN IMMEDIATE')
+    db.execute('''CREATE TABLE IF NOT EXISTS community_posts (
         id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT NOT NULL,
         nickname TEXT NOT NULL, platform TEXT NOT NULL, title TEXT NOT NULL,
-        body TEXT NOT NULL, min_rp INTEGER, mode TEXT,
-        created_at INTEGER NOT NULL)""")
+        body TEXT NOT NULL, min_rp INTEGER, mode TEXT, created_at INTEGER NOT NULL)''')
+    columns = {r[1] for r in db.execute('PRAGMA table_info(community_posts)')}
+    additions = {'author_user_id':'INTEGER', 'completed':'INTEGER NOT NULL DEFAULT 0',
+        'expires_at':'INTEGER', 'completed_at':'INTEGER', 'completion_reason':'TEXT',
+        'matched_comment_id':'INTEGER', 'matched_nickname':'TEXT'}
+    for name, kind in additions.items():
+        if name not in columns: db.execute(f'ALTER TABLE community_posts ADD COLUMN {name} {kind}')
+    db.execute('''CREATE TABLE IF NOT EXISTS community_users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, login_id TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        display_name TEXT NOT NULL, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL)''')
+    db.execute('''CREATE TABLE IF NOT EXISTS community_comments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, post_id INTEGER NOT NULL,
+        user_id INTEGER, nickname TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL)''')
+    db.execute('CREATE INDEX IF NOT EXISTS idx_comments_post ON community_comments(post_id,id)')
+    db.execute('''CREATE TABLE IF NOT EXISTS community_auth_attempts (
+        key TEXT PRIMARY KEY, failures INTEGER NOT NULL DEFAULT 0, window_start INTEGER NOT NULL)''')
+    now = int(time.time())
+    db.execute("UPDATE community_posts SET expires_at=created_at+? WHERE category IN ('duo','squad') AND expires_at IS NULL", (RECRUIT_SECONDS,))
+    db.execute("UPDATE community_posts SET completed=1,completed_at=expires_at,completion_reason='expired' WHERE category IN ('duo','squad') AND completed=0 AND expires_at<=?", (now,))
+    db.commit()
     return db
+
 
 def is_admin():
     return admin_configured() and session.get('gamegg_admin') is True
 
+
 def admin_csrf_ok():
-    token=session.get('gamegg_csrf','')
-    return bool(token) and hmac.compare_digest(str(request.headers.get('X-CSRF-Token','')),token)
+    token = session.get('gamegg_csrf','')
+    return bool(token) and hmac.compare_digest(str(request.headers.get('X-CSRF-Token','')), token)
+
+
+def member():
+    uid = session.get('gamegg_user_id')
+    if not isinstance(uid, int): return None
+    with board_conn() as db:
+        row = db.execute('SELECT id,login_id,display_name FROM community_users WHERE id=?', (uid,)).fetchone()
+    return dict(row) if row else None
+
+
+def user_csrf():
+    if not session.get('gamegg_user_csrf'): session['gamegg_user_csrf'] = secrets.token_urlsafe(32)
+    return session['gamegg_user_csrf']
+
+
+def require_write():
+    origin = request.headers.get('Origin')
+    if origin and urlsplit(origin).netloc.lower() != request.host.lower():
+        raise PUBGError('다른 사이트에서 보낸 요청은 허용하지 않습니다.', 'INVALID_ORIGIN')
+    token = session.get('gamegg_user_csrf','')
+    if not token or not hmac.compare_digest(token, request.headers.get('X-User-CSRF-Token','')):
+        raise PUBGError('로그인 상태를 다시 확인해 주세요. 새로고침 후 다시 시도해 주세요.', 'CSRF_ERROR')
+
+
+def require_member():
+    user = member()
+    if not user: raise PUBGError('로그인 후 이용해 주세요.', 'LOGIN_REQUIRED')
+    return user
+
+
+def json_body():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict): raise PUBGError('입력 내용을 확인해 주세요.', 'INVALID_INPUT')
+    return data
+
+
+def can_manage(post, user):
+    return is_admin() or bool(user and post['author_user_id'] == user['id'])
+
+
+def post_dict(row, user):
+    data = dict(row)
+    data['completed'] = bool(data.get('completed'))
+    data['can_manage'] = can_manage(data, user)
+    data['is_owner'] = bool(user and data.get('author_user_id') == user['id'])
+    return data
+
+
+@app.get('/api/auth/status')
+def auth_status():
+    response = jsonify(ok=True, user=member(), csrf=user_csrf(), server_time=time.time())
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.post('/api/auth/register')
+def auth_register():
+    def run():
+        require_write(); data=json_body()
+        login=str(data.get('login_id','')).strip().lower()
+        name=str(data.get('display_name','')).strip()
+        password=data.get('password')
+        if not re.fullmatch(r'[a-z0-9_]{4,24}',login): raise PUBGError('아이디는 영문 소문자·숫자·밑줄 4~24자로 입력해 주세요.', 'INVALID_INPUT')
+        if not 2<=len(name)<=24 or any(ord(c)<32 for c in name): raise PUBGError('표시 닉네임은 2~24자로 입력해 주세요.', 'INVALID_INPUT')
+        if not isinstance(password,str) or not 8<=len(password)<=128: raise PUBGError('비밀번호는 8~128자로 입력해 주세요.', 'INVALID_INPUT')
+        password_hash=generate_password_hash(password)
+        try:
+            with board_conn() as db:
+                cur=db.execute('INSERT INTO community_users(login_id,display_name,password_hash,created_at) VALUES(?,?,?,?)',(login,name,password_hash,int(time.time())))
+                uid=cur.lastrowid
+        except sqlite3.IntegrityError: raise PUBGError('이미 사용 중인 아이디입니다.', 'DUPLICATE_ACCOUNT')
+        session['gamegg_user_id']=uid;session['gamegg_user_csrf']=secrets.token_urlsafe(32)
+        return {'user':member(),'csrf':user_csrf()}
+    return endpoint(run)
+
+
+@app.post('/api/auth/login')
+def auth_login():
+    def run():
+        require_write();data=json_body()
+        login=str(data.get('login_id','')).strip().lower();password=data.get('password')
+        if not re.fullmatch(r'[a-z0-9_]{4,24}',login) or not isinstance(password,str) or not 1<=len(password)<=128:
+            raise PUBGError('아이디 또는 비밀번호가 올바르지 않습니다.', 'LOGIN_FAILED')
+        import hashlib
+        key=hashlib.sha256(((request.remote_addr or '')+':'+login).encode()).hexdigest()
+        now=int(time.time())
+        with board_conn() as db:
+            attempt=db.execute('SELECT failures,window_start FROM community_auth_attempts WHERE key=?',(key,)).fetchone()
+            if attempt and attempt['failures']>=5 and now-attempt['window_start']<900:
+                raise PUBGError('로그인 시도 횟수를 초과했습니다. 15분 후 다시 시도해 주세요.', 'LOGIN_LIMIT')
+            row=db.execute('SELECT * FROM community_users WHERE login_id=?',(login,)).fetchone()
+        valid=check_password_hash(row['password_hash'] if row else AUTH_DUMMY_HASH,password)
+        if not row or not valid:
+            with board_conn() as db:
+                db.execute('''INSERT INTO community_auth_attempts VALUES(?,1,?) ON CONFLICT(key) DO UPDATE SET
+                    failures=CASE WHEN ?-window_start>=900 THEN 1 ELSE failures+1 END,
+                    window_start=CASE WHEN ?-window_start>=900 THEN ? ELSE window_start END''',(key,now,now,now,now))
+            raise PUBGError('아이디 또는 비밀번호가 올바르지 않습니다.', 'LOGIN_FAILED')
+        with board_conn() as db: db.execute('DELETE FROM community_auth_attempts WHERE key=?',(key,))
+        session['gamegg_user_id']=row['id'];session['gamegg_user_csrf']=secrets.token_urlsafe(32)
+        return {'user':member(),'csrf':user_csrf()}
+    return endpoint(run)
+
+
+@app.post('/api/auth/logout')
+def auth_logout():
+    def run():
+        require_write();session.pop('gamegg_user_id',None);session['gamegg_user_csrf']=secrets.token_urlsafe(32)
+        return {'user':None,'csrf':user_csrf()}
+    return endpoint(run)
+
 
 @app.get('/api/admin/status')
 def admin_status():
     return jsonify(ok=True,admin=is_admin(),configured=False,csrf=session.get('gamegg_csrf') if is_admin() else None)
 
+
 @app.post('/api/admin/logout')
 def admin_logout():
     if not is_admin() or not admin_csrf_ok(): return jsonify(ok=False,error='권한이 없습니다.'),403
-    session.clear()
+    session.pop('gamegg_admin',None);session.pop('gamegg_csrf',None)
     return jsonify(ok=True)
+
 
 @app.delete('/api/admin/posts/<int:post_id>')
 def admin_delete_post(post_id):
     if not is_admin() or not admin_csrf_ok(): return jsonify(ok=False,error='관리자 인증이 필요합니다.'),403
     with board_conn() as db:
+        db.execute('DELETE FROM community_comments WHERE post_id=?',(post_id,))
         cur=db.execute('DELETE FROM community_posts WHERE id=?',(post_id,))
     return jsonify(ok=True,deleted=bool(cur.rowcount))
+
 
 @app.get('/api/board')
 def board_list():
     def run():
         category=request.args.get('category','duo')
         if category not in BOARD_KINDS: raise PUBGError('게시판 종류가 올바르지 않습니다.','INVALID_INPUT')
+        user=member()
         with board_conn() as db:
-            rows=db.execute('SELECT * FROM community_posts WHERE category=? ORDER BY id DESC LIMIT 100',(category,)).fetchall()
-        return {'posts':[dict(r) for r in rows]}
+            rows=db.execute('''SELECT p.*,(SELECT COUNT(*) FROM community_comments c WHERE c.post_id=p.id) AS comment_count
+                FROM community_posts p WHERE p.category=? ORDER BY p.id DESC LIMIT 100''',(category,)).fetchall()
+        return {'posts':[post_dict(r,user) for r in rows],'server_time':time.time()}
     return endpoint(run)
+
 
 @app.post('/api/board')
 def board_create():
     def run():
-        d=request.get_json(silent=True) or {}
-        category=str(d.get('category','')).strip()
-        nickname=str(d.get('nickname','')).strip()
-        platform=str(d.get('platform','')).strip().lower()
-        title=str(d.get('title','')).strip()
-        body=str(d.get('body','')).strip()
-        mode=str(d.get('mode','squad')).strip()
+        require_write();d=json_body();user=member()
+        category=str(d.get('category','')).strip();nickname=str(d.get('nickname','')).strip()
+        platform=str(d.get('platform','')).strip().lower();title=str(d.get('title','')).strip();body=str(d.get('body','')).strip();mode=str(d.get('mode','squad')).strip()
         if category not in BOARD_KINDS: raise PUBGError('게시판 종류가 올바르지 않습니다.','INVALID_INPUT')
         if category=='notice':
-            if not is_admin() or not admin_csrf_ok(): return {'_forbidden': True}
-            nickname=ADMIN_NICKNAME
-            platform='steam'
-            mode='squad'
-            d['min_rp']=0
-        if platform not in SHARDS or mode not in MODES: raise PUBGError('플랫폼/모드를 확인해 주세요.','INVALID_INPUT')
-        if not (2<=len(nickname)<=32 and 2<=len(title)<=80 and 5<=len(body)<=1500):
-            raise PUBGError('닉네임(2~32), 제목(2~80), 본문(5~1500자)을 확인해 주세요.','INVALID_INPUT')
-        try: min_rp=int(d.get('min_rp',0))
-        except (TypeError,ValueError): raise PUBGError('최소 RP는 숫자여야 합니다.','INVALID_INPUT')
-        if not 0<=min_rp<=15000: raise PUBGError('최소 RP는 0~15000 사이여야 합니다.','INVALID_INPUT')
-        # No identity verification: nicknames are self-declared, not authenticated.
+            if not is_admin() or not admin_csrf_ok(): raise PUBGError('관리자 로그인이 필요합니다.','FORBIDDEN')
+            nickname=ADMIN_NICKNAME;platform='steam';mode='squad';d['min_rp']=0
+        elif user: nickname=user['display_name']
+        elif not is_admin(): raise PUBGError('로그인 후 모집글을 작성해 주세요.','LOGIN_REQUIRED')
+        if platform not in SHARDS or mode not in MODES or (category in ('duo','squad') and not mode.startswith(category)):
+            raise PUBGError('게시판에 맞는 플랫폼과 모드를 선택해 주세요.','INVALID_INPUT')
+        if not(2<=len(nickname)<=32 and 2<=len(title)<=80 and 5<=len(body)<=1500):raise PUBGError('닉네임·제목·본문 길이를 확인해 주세요.','INVALID_INPUT')
+        try:rp=int(d.get('min_rp',0))
+        except (TypeError,ValueError):raise PUBGError('최소 RP는 숫자여야 합니다.','INVALID_INPUT')
+        if not 0<=rp<=15000:raise PUBGError('최소 RP는 0~15000 사이여야 합니다.','INVALID_INPUT')
+        now=int(time.time())
         with board_conn() as db:
-            cur=db.execute('INSERT INTO community_posts (category,nickname,platform,title,body,min_rp,mode,created_at) VALUES (?,?,?,?,?,?,?,?)',
-                           (category,nickname,platform,title,body,min_rp,mode,int(time.time())))
-            post_id=cur.lastrowid
-        return {'id':post_id}
-    if (request.get_json(silent=True) or {}).get('category')=='notice' and (not is_admin() or not admin_csrf_ok()):
-        return jsonify(ok=False,error='관리자 로그인이 필요합니다.'),403
+            if user:
+                recent=db.execute('SELECT created_at FROM community_posts WHERE author_user_id=? ORDER BY id DESC LIMIT 1',(user['id'],)).fetchone()
+                if recent and now-recent[0]<10:raise PUBGError('글은 10초 간격으로 등록할 수 있습니다.','POST_COOLDOWN')
+            cur=db.execute('''INSERT INTO community_posts(category,nickname,platform,title,body,min_rp,mode,created_at,author_user_id,expires_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?)''',(category,nickname,platform,title,body,rp,mode,now,user['id'] if user else None,now+RECRUIT_SECONDS if category!='notice' else None))
+            pid=cur.lastrowid
+        return {'id':pid}
     return endpoint(run)
+
+
+@app.delete('/api/board/<int:post_id>')
+def member_delete_post(post_id):
+    def run():
+        require_write();user=require_member()
+        with board_conn() as db:
+            post=db.execute('SELECT * FROM community_posts WHERE id=?',(post_id,)).fetchone()
+            if not post:raise PUBGError('게시글을 찾을 수 없습니다.','NOT_FOUND')
+            if post['category']=='notice' or post['author_user_id']!=user['id']:raise PUBGError('본인의 모집글만 삭제할 수 있습니다.','FORBIDDEN')
+            db.execute('DELETE FROM community_comments WHERE post_id=?',(post_id,));db.execute('DELETE FROM community_posts WHERE id=?',(post_id,))
+        return {'deleted':True}
+    return endpoint(run)
+
+
+@app.post('/api/board/<int:post_id>/status')
+def post_status(post_id):
+    def run():
+        require_write();user=member();d=json_body();action=d.get('action')
+        if action not in ('complete','reopen','match'):raise PUBGError('모집 상태 요청을 확인해 주세요.','INVALID_INPUT')
+        with board_conn() as db:
+            db.execute('BEGIN IMMEDIATE')
+            post=db.execute('SELECT * FROM community_posts WHERE id=?',(post_id,)).fetchone()
+            if not post:raise PUBGError('게시글을 찾을 수 없습니다.','NOT_FOUND')
+            if post['category']=='notice':raise PUBGError('공지사항에는 모집 상태가 없습니다.','INVALID_INPUT')
+            if not can_manage(post,user):raise PUBGError('작성자 또는 관리자만 모집 상태를 바꿀 수 있습니다.','FORBIDDEN')
+            now=int(time.time())
+            if action=='reopen':
+                db.execute("UPDATE community_posts SET completed=0,completed_at=NULL,completion_reason=NULL,matched_comment_id=NULL,matched_nickname=NULL,expires_at=? WHERE id=?",(now+RECRUIT_SECONDS,post_id))
+            elif action=='match':
+                if post['completed'] or post['expires_at']<=now:raise PUBGError('이미 종료된 모집입니다.','POST_COMPLETED')
+                cid=d.get('comment_id')
+                if not isinstance(cid,int) or isinstance(cid,bool):raise PUBGError('댓글을 선택해 주세요.','INVALID_INPUT')
+                comment=db.execute('SELECT * FROM community_comments WHERE id=? AND post_id=?',(cid,post_id)).fetchone()
+                if not comment:raise PUBGError('이 게시글의 댓글이 아닙니다.','NOT_FOUND')
+                if comment['user_id']==post['author_user_id']:raise PUBGError('본인의 댓글은 매칭 대상으로 선택할 수 없습니다.','INVALID_INPUT')
+                db.execute("UPDATE community_posts SET completed=1,completed_at=?,completion_reason='matched',matched_comment_id=?,matched_nickname=? WHERE id=?",(now,cid,comment['nickname'],post_id))
+            else:db.execute("UPDATE community_posts SET completed=1,completed_at=?,completion_reason='manual' WHERE id=?",(now,post_id))
+            row=db.execute('SELECT * FROM community_posts WHERE id=?',(post_id,)).fetchone()
+        return {'post':post_dict(row,user),'server_time':time.time()}
+    return endpoint(run)
+
+
+@app.get('/api/board/<int:post_id>/comments')
+def comment_list(post_id):
+    def run():
+        user=member()
+        with board_conn() as db:
+            post=db.execute('SELECT * FROM community_posts WHERE id=?',(post_id,)).fetchone()
+            if not post:raise PUBGError('게시글을 찾을 수 없습니다.','NOT_FOUND')
+            rows=db.execute('SELECT * FROM community_comments WHERE post_id=? ORDER BY id ASC LIMIT 200',(post_id,)).fetchall()
+        comments=[]
+        for row in rows:
+            data=dict(row);data['can_delete']=is_admin() or bool(user and row['user_id']==user['id'])
+            data['can_match']=post['category']!='notice' and not post['completed'] and can_manage(post,user) and row['user_id']!=post['author_user_id']
+            comments.append(data)
+        return {'post':post_dict(post,user),'comments':comments,'server_time':time.time()}
+    return endpoint(run)
+
+
+@app.post('/api/board/<int:post_id>/comments')
+def comment_create(post_id):
+    def run():
+        require_write();user=require_member();body=str(json_body().get('body','')).strip()
+        if not 1<=len(body)<=500:raise PUBGError('댓글은 1~500자로 입력해 주세요.','INVALID_INPUT')
+        now=int(time.time())
+        with board_conn() as db:
+            db.execute('BEGIN IMMEDIATE')
+            post=db.execute('SELECT * FROM community_posts WHERE id=?',(post_id,)).fetchone()
+            if not post:raise PUBGError('게시글을 찾을 수 없습니다.','NOT_FOUND')
+            if post['category']!='notice' and (post['completed'] or post['expires_at']<=now):raise PUBGError('모집이 완료되어 댓글을 작성할 수 없습니다.','POST_COMPLETED')
+            recent=db.execute('SELECT created_at FROM community_comments WHERE user_id=? ORDER BY id DESC LIMIT 1',(user['id'],)).fetchone()
+            if recent and now-recent[0]<5:raise PUBGError('댓글은 5초 간격으로 등록할 수 있습니다.','COMMENT_COOLDOWN')
+            if db.execute('SELECT COUNT(*) FROM community_comments WHERE post_id=?',(post_id,)).fetchone()[0]>=200:raise PUBGError('이 글의 댓글 등록 한도에 도달했습니다.','COMMENT_LIMIT')
+            cur=db.execute('INSERT INTO community_comments(post_id,user_id,nickname,body,created_at) VALUES(?,?,?,?,?)',(post_id,user['id'],user['display_name'],body,now));cid=cur.lastrowid
+        return {'id':cid}
+    return endpoint(run)
+
+
+@app.delete('/api/board/comments/<int:comment_id>')
+def comment_delete(comment_id):
+    def run():
+        require_write();user=member()
+        with board_conn() as db:
+            row=db.execute('SELECT * FROM community_comments WHERE id=?',(comment_id,)).fetchone()
+            if not row:raise PUBGError('댓글을 찾을 수 없습니다.','NOT_FOUND')
+            if not(is_admin() or (user and row['user_id']==user['id'])):raise PUBGError('본인 댓글만 삭제할 수 있습니다.','FORBIDDEN')
+            db.execute('DELETE FROM community_comments WHERE id=?',(comment_id,))
+        return {'deleted':True}
+    return endpoint(run)
+
 
 if __name__=='__main__':
     print_config_summary(CONFIG_REPORT)

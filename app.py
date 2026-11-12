@@ -1028,35 +1028,9 @@ BOARD_KINDS = ('notice', 'duo', 'squad')
 RECRUIT_SECONDS = 30 * 60
 
 
-def board_conn():
-    db = sqlite3.connect(DB, timeout=15)
-    db.row_factory = sqlite3.Row
-    # Serialize migration between WSGI workers without replacing existing data.
-    db.execute('BEGIN IMMEDIATE')
-    db.execute('''CREATE TABLE IF NOT EXISTS community_posts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT NOT NULL,
-        nickname TEXT NOT NULL, platform TEXT NOT NULL, title TEXT NOT NULL,
-        body TEXT NOT NULL, min_rp INTEGER, mode TEXT, created_at INTEGER NOT NULL)''')
-    columns = {r[1] for r in db.execute('PRAGMA table_info(community_posts)')}
-    additions = {'author_user_id':'INTEGER', 'completed':'INTEGER NOT NULL DEFAULT 0',
-        'expires_at':'INTEGER', 'completed_at':'INTEGER', 'completion_reason':'TEXT',
-        'matched_comment_id':'INTEGER', 'matched_nickname':'TEXT'}
-    for name, kind in additions.items():
-        if name not in columns: db.execute(f'ALTER TABLE community_posts ADD COLUMN {name} {kind}')
-    db.execute('''CREATE TABLE IF NOT EXISTS community_users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, login_id TEXT NOT NULL UNIQUE COLLATE NOCASE,
-        display_name TEXT NOT NULL, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL)''')
-    db.execute('''CREATE TABLE IF NOT EXISTS community_comments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, post_id INTEGER NOT NULL,
-        user_id INTEGER, nickname TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL)''')
-    db.execute('CREATE INDEX IF NOT EXISTS idx_comments_post ON community_comments(post_id,id)')
-    db.execute('''CREATE TABLE IF NOT EXISTS community_auth_attempts (
-        key TEXT PRIMARY KEY, failures INTEGER NOT NULL DEFAULT 0, window_start INTEGER NOT NULL)''')
-    now = int(time.time())
-    db.execute("UPDATE community_posts SET expires_at=created_at+? WHERE category IN ('duo','squad') AND expires_at IS NULL", (RECRUIT_SECONDS,))
-    db.execute("UPDATE community_posts SET completed=1,completed_at=expires_at,completion_reason='expired' WHERE category IN ('duo','squad') AND completed=0 AND expires_at<=?", (now,))
-    db.commit()
-    return db
+# Keep PUBG API cache in SQLite; persist community data in Neon PostgreSQL.
+import psycopg
+from gamegg_postgres import board_conn
 
 
 def is_admin():
@@ -1136,7 +1110,7 @@ def auth_register():
             with board_conn() as db:
                 cur=db.execute('INSERT INTO community_users(login_id,display_name,password_hash,created_at) VALUES(?,?,?,?)',(login,name,password_hash,int(time.time())))
                 uid=cur.lastrowid
-        except sqlite3.IntegrityError: raise PUBGError('이미 사용 중인 아이디입니다.', 'DUPLICATE_ACCOUNT')
+        except psycopg.errors.UniqueViolation: raise PUBGError('이미 사용 중인 아이디입니다.', 'DUPLICATE_ACCOUNT')
         session['gamegg_user_id']=uid;session['gamegg_user_csrf']=secrets.token_urlsafe(32)
         return {'user':member(),'csrf':user_csrf()}
     return endpoint(run)

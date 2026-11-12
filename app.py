@@ -709,6 +709,69 @@ def weapon_icon(code):
 
 
 PLAYSTYLE_VERSION = 'combat-v2'
+# Long telemetry work must not keep a hosting HTTP worker waiting for 20 files.
+STYLE_WORKER = ThreadPoolExecutor(max_workers=1, thread_name_prefix='gamegg-style')
+STYLE_PROGRESS = threading.local()
+STYLE_JOB_PREFIX = 'style-job:v1:'
+
+
+def style_job_write(key, token, payload):
+    """Compare the job token so an interrupted worker cannot overwrite its retry."""
+    with LOCK, db_conn() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute('SELECT value FROM cache WHERE key=?', (key,)).fetchone()
+        if not row or json.loads(row[0]).get('token') != token: return
+        state = json.loads(row[0])
+        state.update(payload, updated_at=time.time())
+        ttl = 180 if state.get('state') == 'ready' else 20 if state.get('state') == 'failed' else 1800
+        db.execute('UPDATE cache SET value=?,expires=? WHERE key=?', (json.dumps(state,ensure_ascii=False),time.time()+ttl,key))
+
+
+def run_style_job(key, token, params):
+    try:
+        STYLE_PROGRESS.callback = lambda done,total: style_job_write(key,token,{'completed':done,'total':total})
+        # No browser session or Flask request object crosses thread boundaries.
+        with app.test_request_context('/api/playstyle', query_string=params):
+            response = playstyle()
+            result = response[0].get_json() if isinstance(response,tuple) else response.get_json()
+        style_job_write(key,token,{'state':'ready' if result.get('ok') else 'failed','result':result})
+    except Exception:
+        app.logger.exception('Playstyle background job failed')
+        style_job_write(key,token,{'state':'failed','result':{'ok':False,'code':'STYLE_JOB_ERROR','error':'전투 성향 분석 중 서버 오류가 발생했습니다. 잠시 후 다시 검색해 주세요.'}})
+    finally:
+        STYLE_PROGRESS.callback = None
+
+
+def request_style_job(nickname, platform, limit, selected_mode):
+    import hashlib
+    digest=hashlib.sha256(json.dumps([nickname.casefold(),platform,limit,selected_mode]).encode()).hexdigest()
+    key=STYLE_JOB_PREFIX+digest
+    now=time.time();token=secrets.token_hex(16);submit=False
+    with LOCK, db_conn() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row=db.execute('SELECT value FROM cache WHERE key=? AND expires>?',(key,now)).fetchone()
+        state=json.loads(row[0]) if row else None
+        # Heartbeat is updated after every bounded upstream request. Recover a
+        # job interrupted by deployment/restart, including across Gunicorn workers.
+        if state and state.get('state')=='pending' and now-state.get('updated_at',0)>150:state=None
+        if state is None:
+            rows=db.execute('SELECT value FROM cache WHERE key LIKE ? AND expires>?',(STYLE_JOB_PREFIX+'%',now)).fetchall()
+            active=sum(1 for r in rows if (s:=json.loads(r[0])).get('state')=='pending' and now-s.get('updated_at',0)<=150)
+            if active>=1:raise PUBGError('다른 전투 성향을 분석 중입니다. 잠시 후 다시 시도해 주세요.','STYLE_BUSY',retry_after=10)
+            state={'token':token,'state':'pending','created_at':now,'updated_at':now,'completed':0,'total':limit}
+            db.execute('INSERT OR REPLACE INTO cache VALUES (?,?,?)',(key,json.dumps(state),now+1800))
+            submit=True
+    if submit:
+        try:STYLE_WORKER.submit(run_style_job,key,token,{'nickname':nickname,'platform':platform,'limit':limit,'mode':selected_mode})
+        except RuntimeError:
+            style_job_write(key,token,{'state':'failed','result':{'ok':False,'code':'STYLE_JOB_ERROR','error':'분석 작업을 시작하지 못했습니다. 잠시 후 다시 시도해 주세요.'}})
+            raise PUBGError('분석 작업을 시작하지 못했습니다. 잠시 후 다시 시도해 주세요.','STYLE_JOB_ERROR')
+    if state.get('state') in ('ready','failed'):
+        result=state['result']
+        if not result.get('ok'):raise PUBGError(result.get('error','분석에 실패했습니다.'),result.get('code','NO_STYLE_DATA'),result.get('upstream_status'),result.get('retry_after'))
+        return {**result,'analysis_state':'ready'}
+    return {'analysis_state':'pending','completed':state['completed'],'total':state['total'],'retry_after':3,
+        'message':'최근 경기 텔레메트리를 분석 중입니다. 첫 조회는 시간이 걸릴 수 있습니다.'}
 
 
 def combat_features(events, account_id):
@@ -823,28 +886,42 @@ def score_combat(features, survival):
 def playstyle_for(nickname, platform, limit=20):
     player=lookup(nickname,platform);matches=list(dict.fromkeys(player.get('match_ids') or []))[:min(20,limit)]
     if not matches:raise PUBGError('최근 경기 기록이 없습니다.','NO_MATCHES')
-    samples=[];errors=0
+    samples=[];errors=0;failures={}
+    def record_failure(code,message):
+        failures.setdefault(code,{'code':code,'count':0,'message':message})['count']+=1
+    def progress(done):
+        callback=getattr(STYLE_PROGRESS,'callback',None)
+        if callback:callback(done,len(matches))
+    progress(0)
     for mid in matches:
         try:
             with app.test_request_context('/api/match-telemetry',query_string={'match_id':mid,'nickname':nickname,'platform':platform}):
                 response=match_telemetry();result=response[0].get_json() if isinstance(response,tuple) else response.get_json()
-            if not result.get('ok'):errors+=1;continue
+            if not result.get('ok'):
+                errors+=1;record_failure(result.get('code','TELEMETRY_ERROR'),result.get('error','텔레메트리 요청 실패'));continue
             features=result.get('style_features') or {}
             match=api_get(platform,'matches/'+quote(mid,safe=''),ttl=1800,authenticated=False)
             detail=parse_match(match,player['account_id'])
             scores=score_combat(features,detail.get('survival') if detail else None)
-            if scores is None:errors+=1;continue
+            if scores is None:
+                errors+=1;record_failure('INCOMPLETE_STYLE_DATA',features.get('reason') or '플레이어의 생존 시간 또는 교전 자료가 부족합니다.');continue
             samples.append({'match_id':mid,'scores':scores,'early_damage':features['early_damage'],
                 'first_combat_seconds':features['first_combat_seconds'],'early_knocks':features['early_knocks'],
                 'early_kills':features['early_kills'],'survival':detail.get('survival')})
-        except (PUBGError,ValueError,TypeError,KeyError):errors+=1
-    if not samples:raise PUBGError('분석 가능한 피해/교전 텔레메트리가 없습니다.','NO_STYLE_DATA')
+        except PUBGError as e:
+            errors+=1;record_failure(e.code,str(e))
+        except (ValueError,TypeError,KeyError):
+            errors+=1;record_failure('BAD_STYLE_DATA','경기 또는 교전 데이터 형식을 해석하지 못했습니다.')
+        finally:progress(len(samples)+errors)
+    if not samples:
+        reasons=' / '.join(f"{v['message']} ({v['count']}경기, {v['code']})" for v in failures.values())
+        raise PUBGError('전투 성향을 분석하지 못했습니다. '+reasons,'NO_STYLE_DATA')
     axes=('yeopo','jonbeo','balance');counts={k:sum(s['scores'][k] is not None for s in samples) for k in axes}
     # Short matches contribute to aggression but not to passive/balanced classification.
     scores={k:round(15+85*(sum(s['scores'][k] for s in samples if s['scores'][k] is not None)/counts[k])/100,1) if counts[k] else 15.0 for k in axes}
     firsts=[s['first_combat_seconds'] for s in samples if s['first_combat_seconds'] is not None]
     return {'nickname':player['nickname'],'platform':platform,'algorithm_version':PLAYSTYLE_VERSION,
-        'matches_analyzed':len(samples),'matches_requested':len(matches),'matches_failed':errors,
+        'matches_analyzed':len(samples),'matches_requested':len(matches),'matches_failed':errors,'failure_reasons':list(failures.values()),
         'axis_matches':counts,'axis_available':{k:counts[k]>0 for k in axes},'base_score':15,'scores':scores,
         'early_damage_average':round(sum(s['early_damage'] for s in samples)/len(samples),1),
         'first_combat_average':round(sum(firsts)/len(firsts),1) if firsts else None,
@@ -860,6 +937,10 @@ def playstyle():
         if platform not in SHARDS: raise PUBGError('잘못된 플랫폼입니다.','INVALID_INPUT')
         try: limit=min(20,max(1,int(request.args.get('limit','20'))))
         except ValueError: raise PUBGError('limit은 숫자여야 합니다.','INVALID_INPUT')
+        selected_mode=request.args.get('mode','squad')
+        if selected_mode not in MODES: raise PUBGError('모드를 확인해 주세요.','INVALID_INPUT')
+        if not nickname or len(nickname)>80 or any(ord(c)<32 for c in nickname):raise PUBGError('닉네임을 확인해 주세요.','INVALID_INPUT')
+        if request.args.get('async')=='1':return request_style_job(nickname,platform,limit,selected_mode)
         result=playstyle_for(nickname,platform,limit)
         # Cache peer samples only from users actually analyzed on this server.
         # Same-platform RP cohorts are based on the current ranked squad RP.

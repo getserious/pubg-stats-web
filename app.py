@@ -1286,8 +1286,14 @@ def comment_create(post_id):
             if not post:raise PUBGError('게시글을 찾을 수 없습니다.','NOT_FOUND')
             if post['category']!='notice' and (post['completed'] or post['expires_at']<=now):raise PUBGError('모집이 완료되어 댓글을 작성할 수 없습니다.','POST_COMPLETED')
             recent=db.execute('SELECT created_at FROM community_comments WHERE user_id=? ORDER BY id DESC LIMIT 1',(user['id'],)).fetchone()
-            if recent and now-recent[0]<5:raise PUBGError('댓글은 5초 간격으로 등록할 수 있습니다.','COMMENT_COOLDOWN')
-            if db.execute('SELECT COUNT(*) FROM community_comments WHERE post_id=?',(post_id,)).fetchone()[0]>=200:raise PUBGError('이 글의 댓글 등록 한도에 도달했습니다.','COMMENT_LIMIT')
+            if recent and now - recent['created_at'] < 5:
+                raise PUBGError('댓글은 5초 간격으로 등록할 수 있습니다.', 'COMMENT_COOLDOWN')
+            comment_count = db.execute(
+                'SELECT COUNT(*) AS comment_count FROM community_comments WHERE post_id=?',
+                (post_id,)
+            ).fetchone()
+            if comment_count['comment_count'] >= 200:
+                raise PUBGError('이 글의 댓글 등록 한도에 도달했습니다.', 'COMMENT_LIMIT')
             cur=db.execute('INSERT INTO community_comments(post_id,user_id,nickname,body,created_at) VALUES(?,?,?,?,?)',(post_id,user['id'],user['display_name'],body,now));cid=cur.lastrowid
         return {'id':cid}
     return endpoint(run)

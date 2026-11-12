@@ -23,10 +23,15 @@ class BoardRow(dict):
 
 
 def _row_factory(cursor):
+    if cursor.description is None:
+        return lambda row: row
+
     names = [col.name for col in cursor.description]
-    def make(values):
-        return BoardRow(zip(names, values))
-    return make
+
+    def make_row(row):
+        return dict(zip(names, row))
+
+    return make_row
 
 
 class BoardCursor:

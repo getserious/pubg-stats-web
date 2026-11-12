@@ -1208,7 +1208,7 @@ def board_create():
         with board_conn() as db:
             if user:
                 recent=db.execute('SELECT created_at FROM community_posts WHERE author_user_id=? ORDER BY id DESC LIMIT 1',(user['id'],)).fetchone()
-                if recent and now-recent[0]<10:raise PUBGError('글은 10초 간격으로 등록할 수 있습니다.','POST_COOLDOWN')
+                if recent and now - next(iter(recent.values())) < 10:raise PUBGError('글은 10초 간격으로 등록할 수 있습니다.','POST_COOLDOWN')
             cur=db.execute('''INSERT INTO community_posts(category,nickname,platform,title,body,min_rp,mode,created_at,author_user_id,expires_at)
                 VALUES(?,?,?,?,?,?,?,?,?,?)''',(category,nickname,platform,title,body,rp,mode,now,user['id'] if user else None,now+RECRUIT_SECONDS if category!='notice' else None))
             pid=cur.lastrowid
